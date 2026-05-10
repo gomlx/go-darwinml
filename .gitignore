@@ -26,3 +26,6 @@ tmp/
 # Go workspace (local development only)
 go.work
 go.work.sum
+
+# Metal toolchain intermediates (sources are kernels/*.metal; bundle is gomlx_metal.metallib)
+metal/kernels/*.air
