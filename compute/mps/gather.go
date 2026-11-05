@@ -495,7 +495,8 @@ func (f *Function) scatterImpl(
 	}
 
 	// Try simple scatter along a single axis (common case for embedding gradients).
-	// Only valid when batch axes come first in updates (i.e. updateWindowAxes are trailing axes).
+	// Only valid when batch axes come first in updates (i.e. updateWindowAxes are trailing axes)
+	// and updates has the same rank as operand (or can be flattened into operand rank).
 	canUseSimpleScatter := len(scatterAxesToOperandAxes) == 1 && len(insertedWindowAxes) == 1 && scatterAxesToOperandAxes[0] == 0
 	for i, uwAx := range updateWindowAxes {
 		if uwAx != (updatesNode.shape.Rank()-len(updateWindowAxes))+i {
@@ -509,32 +510,33 @@ func (f *Function) scatterImpl(
 		// Flatten indices to remove indexVectorAxis, yielding batch dimensions.
 		idxTensor := indicesNode.tensor
 		idxRank := indicesNode.shape.Rank()
-		batchDims := make([]int64, 0, idxRank)
+		batchSize := int64(1)
 		for i, d := range indicesNode.shape.Dimensions {
 			if i != indexVectorAxis || indexVectorAxis >= idxRank {
-				batchDims = append(batchDims, int64(d))
-			}
-		}
-		if len(batchDims) == 0 {
-			batchDims = []int64{1}
-		}
-		if indexVectorAxis < idxRank {
-			idxTensor, err = f.ctx().Reshape(idxTensor, batchDims)
-			if err != nil {
-				return nil, errors.Wrap(err, opName+": reshape indices")
+				batchSize *= int64(d)
 			}
 		}
 
-		// MPSGraph's scatterAlongAxis requires indices rank == updates rank.
-		// Reshape indices to match updates rank: batch dims go into the scatter axis,
-		// size-1 for all other axes, then broadcast to updates shape.
-		updatesRank := updatesNode.shape.Rank()
-		batchSize := int64(1)
-		for _, d := range batchDims {
-			batchSize *= d
+		// MPSGraph's scatterAlongAxis requires operand, updates, and indices to all have the same rank.
+		// Since axis == 0 and updateWindowAxes are the trailing (operandRank - 1) axes of updates,
+		// flatten all leading batch axes of updates into axis 0 of shape [batchSize, updateWindowDims...].
+		operandRank := operandNode.shape.Rank()
+		updatesFlatShape := make([]int64, operandRank)
+		updatesFlatShape[0] = batchSize
+		for i, uwAx := range updateWindowAxes {
+			updatesFlatShape[1+i] = int64(updatesNode.shape.Dimensions[uwAx])
 		}
-		idxFullShape := make([]int64, updatesRank)
-		for i := range updatesRank {
+
+		updatesTensor := updatesNode.tensor
+		if updatesNode.shape.Rank() != operandRank || int64(updatesNode.shape.Dimensions[0]) != batchSize {
+			updatesTensor, err = f.ctx().Reshape(updatesTensor, updatesFlatShape)
+			if err != nil {
+				return nil, errors.Wrap(err, opName+": reshape updates to operand rank")
+			}
+		}
+
+		idxFullShape := make([]int64, operandRank)
+		for i := range operandRank {
 			if i == axis {
 				idxFullShape[i] = batchSize
 			} else {
@@ -543,24 +545,16 @@ func (f *Function) scatterImpl(
 		}
 		idxTensor, err = f.ctx().Reshape(idxTensor, idxFullShape)
 		if err != nil {
-			return nil, errors.Wrap(err, opName+": reshape indices to updates rank")
+			return nil, errors.Wrap(err, opName+": reshape indices to operand rank")
 		}
 
-		// Broadcast to match updates shape.
-		broadcastShape := make([]int64, updatesRank)
-		for i, d := range updatesNode.shape.Dimensions {
-			if i == axis {
-				broadcastShape[i] = batchSize
-			} else {
-				broadcastShape[i] = int64(d)
-			}
-		}
-		idxTensor, err = f.ctx().BroadcastTo(idxTensor, broadcastShape)
+		// Broadcast indices to match flattened updates shape.
+		idxTensor, err = f.ctx().BroadcastTo(idxTensor, updatesFlatShape)
 		if err != nil {
 			return nil, errors.Wrap(err, opName+": broadcast indices")
 		}
 
-		result, err := f.ctx().ScatterAlongAxis(operandNode.tensor, idxTensor, updatesNode.tensor, axis, scatterMode)
+		result, err := f.ctx().ScatterAlongAxis(operandNode.tensor, idxTensor, updatesTensor, axis, scatterMode)
 		if err != nil {
 			return nil, errors.Wrap(err, opName+": scatter along axis")
 		}

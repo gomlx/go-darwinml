@@ -1570,27 +1570,136 @@ func (f *Function) Pad(operand, fillValue compute.Value, axesConfig ...compute.P
 		return nil, errors.Wrap(err, "Pad: fillValue")
 	}
 
-	// Check for interior padding (not supported by basic MPSGraph pad).
-	for _, ac := range axesConfig {
-		if ac.Interior != 0 {
-			return nil, errors.Wrapf(compute.ErrNotImplemented, "Pad: interior padding not supported in %q backend", BackendName)
-		}
+	if fillNode.shape.Rank() != 0 || fillNode.shape.DType != opNode.shape.DType {
+		return nil, errors.Errorf("Pad: fillValue must be scalar of dtype %s, got %s", opNode.shape.DType, fillNode.shape)
 	}
 
-	padBefore := make([]int64, len(axesConfig))
-	padAfter := make([]int64, len(axesConfig))
-	outDims := make([]int, len(axesConfig))
-	for i, ac := range axesConfig {
-		padBefore[i] = int64(ac.Start)
-		padAfter[i] = int64(ac.End)
-		outDims[i] = opNode.shape.Dimensions[i] + ac.Start + ac.End
-	}
-
-	tensor, err := f.ctx().Pad(opNode.tensor, fillNode.tensor, padBefore, padAfter)
+	outShape, err := shapeinference.Pad(opNode.shape, axesConfig...)
 	if err != nil {
 		return nil, errors.Wrap(err, "Pad")
 	}
-	outShape := shapes.Make(opNode.shape.DType, outDims...)
+	if outShape.Size() == 0 {
+		return &graphNode{tensor: nil, shape: outShape, owner: f}, nil
+	}
+	if opNode.shape.Size() == 0 {
+		tensor, err := f.ctx().BroadcastTo(fillNode.tensor, toInt64Slice(outShape.Dimensions))
+		if err != nil {
+			return nil, errors.Wrap(err, "Pad: broadcast fillValue for empty operand")
+		}
+		return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
+	}
+
+	rank := len(axesConfig)
+	tensor := opNode.tensor
+	currentShape := toInt64Slice(opNode.shape.Dimensions)
+
+	// Step 1: Handle interior padding per axis by reshaping [N] -> [N, 1],
+	// padding the new axis with ac.Interior, flattening to [N*(ac.Interior+1)],
+	// and slicing to [(N-1)*ac.Interior + N].
+	for i, ac := range axesConfig {
+		if ac.Interior > 0 {
+			n := currentShape[i]
+			if n > 1 {
+				dilation := int64(ac.Interior) + 1
+
+				// Reshape to split axis i into [n, 1].
+				reshapeDims := make([]int64, rank+1)
+				copy(reshapeDims[:i], currentShape[:i])
+				reshapeDims[i] = n
+				reshapeDims[i+1] = 1
+				copy(reshapeDims[i+2:], currentShape[i+1:])
+
+				tensor, err = f.ctx().Reshape(tensor, reshapeDims)
+				if err != nil {
+					return nil, errors.Wrapf(err, "Pad: interior reshape axis %d", i)
+				}
+
+				// Pad axis i+1 with ac.Interior after.
+				padBefore := make([]int64, rank+1)
+				padAfter := make([]int64, rank+1)
+				padAfter[i+1] = int64(ac.Interior)
+				tensor, err = f.ctx().Pad(tensor, fillNode.tensor, padBefore, padAfter)
+				if err != nil {
+					return nil, errors.Wrapf(err, "Pad: interior pad axis %d", i)
+				}
+
+				// Reshape to flatten axis i back to [n * dilation].
+				flatDims := make([]int64, rank)
+				copy(flatDims, currentShape)
+				flatDims[i] = n * dilation
+				tensor, err = f.ctx().Reshape(tensor, flatDims)
+				if err != nil {
+					return nil, errors.Wrapf(err, "Pad: interior flatten axis %d", i)
+				}
+
+				// Slice off trailing ac.Interior elements on axis i.
+				dilatedSize := n + (n-1)*int64(ac.Interior)
+				starts := make([]int64, rank)
+				ends := make([]int64, rank)
+				strides := make([]int64, rank)
+				for ax := range rank {
+					ends[ax] = flatDims[ax]
+					strides[ax] = 1
+				}
+				ends[i] = dilatedSize
+				tensor, err = f.ctx().Slice(tensor, starts, ends, strides)
+				if err != nil {
+					return nil, errors.Wrapf(err, "Pad: interior slice axis %d", i)
+				}
+
+				currentShape[i] = dilatedSize
+			}
+		}
+	}
+
+	// Step 2: Handle negative Start / End padding (cropping) via Slice.
+	hasCrop := false
+	cropStarts := make([]int64, rank)
+	cropEnds := make([]int64, rank)
+	cropStrides := make([]int64, rank)
+	for i, ac := range axesConfig {
+		cropStrides[i] = 1
+		cropEnds[i] = currentShape[i]
+		if ac.Start < 0 {
+			cropStarts[i] = int64(-ac.Start)
+			hasCrop = true
+		}
+		if ac.End < 0 {
+			cropEnds[i] = currentShape[i] + int64(ac.End)
+			hasCrop = true
+		}
+	}
+	if hasCrop {
+		tensor, err = f.ctx().Slice(tensor, cropStarts, cropEnds, cropStrides)
+		if err != nil {
+			return nil, errors.Wrap(err, "Pad: negative padding slice")
+		}
+		for i := range rank {
+			currentShape[i] = cropEnds[i] - cropStarts[i]
+		}
+	}
+
+	// Step 3: Handle positive Start / End padding via Pad.
+	hasPad := false
+	padBefore := make([]int64, rank)
+	padAfter := make([]int64, rank)
+	for i, ac := range axesConfig {
+		if ac.Start > 0 {
+			padBefore[i] = int64(ac.Start)
+			hasPad = true
+		}
+		if ac.End > 0 {
+			padAfter[i] = int64(ac.End)
+			hasPad = true
+		}
+	}
+	if hasPad {
+		tensor, err = f.ctx().Pad(tensor, fillNode.tensor, padBefore, padAfter)
+		if err != nil {
+			return nil, errors.Wrap(err, "Pad")
+		}
+	}
+
 	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
