@@ -1,132 +1,65 @@
 # go-darwinml
 
-Go backends for machine learning on Apple Silicon, providing [GoMLX](https://github.com/gomlx/gomlx) integration with multiple Apple hardware accelerators.
+Apple Silicon hardware acceleration backends for [GoMLX](https://github.com/gomlx/gomlx) / [`github.com/gomlx/compute`](https://github.com/gomlx/compute).
 
 ## Backends
 
-| Backend | Hardware | Import |
-|---------|----------|--------|
-| **CoreML** | ANE, GPU, CPU | `github.com/gomlx/go-darwinml/coreml/gomlx` |
-| **MPSGraph** | GPU (Metal) | `github.com/gomlx/go-darwinml/mpsgraph/gomlx` |
+| Backend Name | Package | Framework | Hardware |
+|--------------|---------|-----------|----------|
+| **`mps`** | `github.com/gomlx/go-darwinml/compute/mps` | Metal Performance Shaders Graph (`MPSGraph`) | Apple GPU (Metal) |
 
-## Status
-
-**Alpha** - Core functionality is implemented but the API may change.
+*(Future planned backend: **`mlx`** using Apple's MLX framework.)*
 
 ## Requirements
 
-- macOS 12.0+ (Monterey or later)
-- Xcode (full installation for coremlcompiler)
-- Go 1.25+
+- macOS 13.0+ (Ventura or later; macOS 14.0+ Sonoma for `BFloat16` and native `scaledDotProductAttention`)
+- Xcode Command Line Tools (`xcode-select --install`) for CGo + Metal/MPSGraph frameworks
+- Go 1.27+
 
 ## Installation
 
 ```bash
-# CoreML backend
-go get github.com/gomlx/go-darwinml/coreml/gomlx
-
-# MPSGraph backend
-go get github.com/gomlx/go-darwinml/mpsgraph/gomlx
+go get github.com/gomlx/go-darwinml
 ```
 
 ## Usage
 
-### GoMLX Backend
-
-Import the backend you want to register it with GoMLX:
+Import the `mps` backend to register `"mps"` with `github.com/gomlx/compute/backends`:
 
 ```go
-import _ "github.com/gomlx/go-darwinml/coreml/gomlx"
-// or
-import _ "github.com/gomlx/go-darwinml/mpsgraph/gomlx"
-```
-
-### Building a CoreML MIL Program Directly
-
-```go
-package main
-
 import (
-    "fmt"
-    "github.com/gomlx/go-darwinml/coreml/model"
-    "github.com/gomlx/go-darwinml/coreml/runtime"
+	"github.com/gomlx/compute/backends"
+	_ "github.com/gomlx/go-darwinml/compute/mps"
 )
 
 func main() {
-    // Build a simple model: y = relu(x)
-    b := model.NewBuilder("main")
-    x := b.Input("x", model.Float32, 2, 3)
-    y := b.Relu(x)
-    b.Output("y", y)
-
-    // Compile and load
-    rt := runtime.New()
-    exec, err := rt.Compile(b)
-    if err != nil {
-        panic(err)
-    }
-    defer exec.Close()
-
-    // Run inference
-    input := []float32{-1, 2, -3, 4, -5, 6}
-    outputs, err := exec.Run(map[string]interface{}{"x": input})
-    if err != nil {
-        panic(err)
-    }
-
-    result := outputs["y"].([]float32)
-    fmt.Println("Output:", result)
-    // Output: [0 2 0 4 0 6]
+	backend, err := backends.NewWithConfig("mps")
+	if err != nil {
+		panic(err)
+	}
+	defer backend.Finalize()
 }
 ```
 
-### Compute Unit Selection (CoreML)
-
-```go
-import "github.com/gomlx/go-darwinml/coreml/internal/bridge"
-
-// Use all available compute units (ANE + GPU + CPU)
-rt := runtime.New(runtime.WithComputeUnits(bridge.ComputeAll))
-
-// CPU only (for debugging)
-rt := runtime.New(runtime.WithComputeUnits(bridge.ComputeCPUOnly))
-
-// CPU + GPU (skip Neural Engine)
-rt := runtime.New(runtime.WithComputeUnits(bridge.ComputeCPUAndGPU))
-
-// CPU + Neural Engine (skip GPU)
-rt := runtime.New(runtime.WithComputeUnits(bridge.ComputeCPUAndANE))
-```
+Or select it via the `GOMLX_BACKEND=mps` environment variable when using GoMLX.
 
 ## Project Structure
 
 ```
 go-darwinml/
-├── blob/                       # Shared weight blob storage format
-├── proto/coreml/               # CoreML protobuf definitions & generated types
-├── coreml/                     # CoreML backend
-│   ├── gomlx/                  # GoMLX backend implementation
-│   ├── model/                  # MIL program builder & serialization
-│   ├── runtime/                # Model compilation & execution
-│   └── internal/bridge/        # Objective-C++ bridge to CoreML
-└── mpsgraph/                   # MPSGraph backend
-    └── gomlx/                  # GoMLX backend implementation
-        └── internal/bridge/    # Objective-C++ bridge to MPSGraph
+├── compute/
+│   └── mps/                # GoMLX compute.Backend implementation ("mps")
+└── internal/
+    └── bridge/             # CGo / Objective-C bridge to Metal & MPSGraph
 ```
 
 ## Development
 
 ```bash
-# Test all modules
-go test github.com/gomlx/go-darwinml/...
-
-# Regenerate protobuf code
-cd proto/coreml && go generate ./...
+# Run unit and backend compliance tests
+go test ./...
 ```
 
 ## License
 
 Apache 2.0 - see LICENSE file.
-
-CoreML protobuf definitions are from [Apple's coremltools](https://github.com/apple/coremltools)
-and are licensed under BSD-3-Clause.

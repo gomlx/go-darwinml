@@ -1,0 +1,9 @@
+- 2026-11-05:
+  - Migrated `go-darwinml` to the `github.com/gomlx/compute` backend interface:
+    - Consolidated into a single Go module (`github.com/gomlx/go-darwinml`) without depending on `github.com/gomlx/gomlx`.
+    - Removed legacy MIL/CoreML (`coreml/`, `proto/`, `blob/`) packages in favor of `MPSGraph`.
+    - Moved the MPSGraph backend to `compute/mps` (registered as `"mps"`) and the Objective-C CGo bridge to `internal/bridge`.
+    - Implemented true zero-copy unified memory shared buffers (`MTLBuffer` with `MTLResourceStorageModeShared` + `initWithMTLBuffer:shape:dataType:`) with `runtime.AddCleanup` automatic garbage-collection cleanup and mixed-scope ping-pong pooling of donated input buffers (per-`Executable` primary pool with cross-executable stealing and idle eviction).
+    - Added [`docs/MPSGraph.md`](MPSGraph.md) documenting the backend architecture and buffer management design.
+    - Implemented full `compute.Backend` / `compute.Function` compliance, including general `Gather` axis permutations, `Scatter` into non-zero operand tensors (`scatterNDWithDataTensor`), empty `Slice` handling, 32-bit/64-bit integer `RNGBitGenerator`, and fused operations (`FusedSoftmax`, `FusedGelu`, `FusedLayerNorm`, `FusedDense`, `FusedScaledDotProductAttention`, `FusedAttentionQKVProjection`, and `FusedActivation` with `HardSigmoid`, `LeakyRelu`, `Selu`, `HardSwish`, and `SwiGLU`).
+    - Verified all unit tests and `backendtest.RunAll` compliance suites pass on Apple Silicon.
