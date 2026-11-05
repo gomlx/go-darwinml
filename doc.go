@@ -1,21 +1,15 @@
-// Package godarwinml provides Go backends for machine learning on Apple Silicon.
+// Copyright 2023-2026 The GoMLX Authors. SPDX-License-Identifier: Apache-2.0
+
+// Package godarwinml provides GoMLX compute backends for Apple Silicon (macOS).
 //
-// This project provides multiple GoMLX backends targeting Apple hardware:
+// Currently available backends:
 //
-//   - coreml: CoreML backend supporting Apple Neural Engine (ANE), Metal GPU, and CPU
-//   - mpsgraph: MPSGraph backend for direct Metal GPU computation
-//
-// Each backend implements the GoMLX backends.Backend interface and can be used
-// interchangeably for inference on Apple Silicon.
-//
-// # Shared Packages
-//
-//   - blob: Weight blob storage format
-//   - proto: CoreML protobuf specifications
+//   - github.com/gomlx/go-darwinml/compute/mps ("mps"): Metal Performance Shaders Graph (MPSGraph)
+//     backend for GPU computation on Apple Silicon.
 //
 // # Requirements
 //
-//   - macOS 12.0+ (Monterey or later)
+//   - macOS 13.0+ (Ventura or later, macOS 15.0+ recommended for scatter operations)
 //   - Xcode Command Line Tools
-//   - Go 1.25+
+//   - Go 1.27+
 package godarwinml
