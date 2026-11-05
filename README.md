@@ -24,16 +24,17 @@ go get github.com/gomlx/go-darwinml
 
 ## Usage
 
-Import the `mps` backend to register `"mps"` with `github.com/gomlx/compute/backends`:
+On Darwin (macOS) machines, the `"mps"` backend is **included by default** when importing GoMLX's default backends package (`_ "github.com/gomlx/gomlx/backends/default"`), or it can be explicitly imported with `_ "github.com/gomlx/go-darwinml/compute/mps"`:
 
 ```go
 import (
-	"github.com/gomlx/compute/backends"
-	_ "github.com/gomlx/go-darwinml/compute/mps"
+	"github.com/gomlx/compute"
+	_ "github.com/gomlx/gomlx/backends/default" // Includes "mps" by default on Darwin; or use:
+	// _ "github.com/gomlx/go-darwinml/compute/mps"
 )
 
 func main() {
-	backend, err := backends.NewWithConfig("mps")
+	backend, err := compute.NewWithConfig("mps")
 	if err != nil {
 		panic(err)
 	}
@@ -41,7 +42,21 @@ func main() {
 }
 ```
 
-Or select it via the `GOMLX_BACKEND=mps` environment variable when using GoMLX.
+Or select it at runtime via the `GOMLX_BACKEND=mps` environment variable when calling `compute.New()` / `compute.MustNew()`.
+
+See [`docs/MPSGraph.md`](docs/MPSGraph.md) for detailed architecture and buffer management documentation.
+
+## Limitations (`"mps"`)
+
+- **Unsupported DTypes**: Apple Metal / `MPSGraph` does not support 64-bit floats (`Float64`), complex numbers (`Complex64`, `Complex128`), or sub-byte integer types (`Int2`, `Int4`, `Uint2`, `Uint4`).
+- **Unsupported Operations**:
+  - **Complex & FFT ops**: `Complex`, `Real`, `Imag`, `Conj`, `FFT`.
+  - **Bit-level & bitwise reduction ops**: `Bitcast`, `BitCount`, `Clz`, `ReduceBitwiseAnd`, `ReduceBitwiseOr`, `ReduceBitwiseXor`, `ReduceLogicalXor`.
+  - **Pooling scatter variants**: `SelectAndScatterSum`, `SelectAndScatterMin` (`SelectAndScatterMax` is supported).
+  - **Dynamic shape ops**: `DynamicBroadcastInDim`, `DynamicIota`, `DynamicPad`, `DynamicReshape`, `DynamicShape`, `DynamicDimensionSize`.
+  - **Collective / distributed ops**: `AllReduce`, `AllGather`, `CollectiveBroadcast`.
+  - **Barriers & quantized fused ops**: `OptimizationBarrier`, `SchedulingBarrier`, `FusedQuantizedDense`, `QuantizedEmbeddingLookup`.
+  - *(Note: Operations with GoMLX graph decompositions, such as `CumSum` and `CumMax`, automatically fall back to their decomposed implementations).*
 
 ## Project Structure
 
