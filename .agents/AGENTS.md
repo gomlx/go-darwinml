@@ -31,3 +31,5 @@ Currently implemented backend:
    - `mpsgraph_scatter_nd` uses `[ctx.graph scatterNDWithDataTensor:updatesTensor:indicesTensor:batchDimensions:0 mode:scatterMode name:nil]` so scatter updates are applied into the initial operand tensor `data` (preserving untouched operand elements).
 5. **No Dependency on `github.com/gomlx/gomlx`**:
    - Like `./go-xla` and `./compute-onnx`, `./go-darwinml` depends only on `github.com/gomlx/compute` (not `github.com/gomlx/gomlx`) to avoid circular module dependencies. Use `compute/support/backendtest` and `compute/support/testutil` for testing.
+6. **Generic Backend Tests Belong in `github.com/gomlx/compute/support/backendtest`**:
+   - When adding compliance or operation tests that other backends can benefit from, add them directly to `github.com/gomlx/compute/support/backendtest/` rather than keeping backend-specific duplicates. Ensure every test gracefully skips when the capability or dtype is absent (`testutil.SkipIfMissing`, `testutil.SkipIfMissingDType`, `testutil.SkipIfMissingDynamicShapes`) or when an operation returns `compute.ErrNotImplemented` (`compute.IsNotImplemented(err)`).

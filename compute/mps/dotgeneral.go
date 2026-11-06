@@ -75,6 +75,9 @@ func (f *Function) DotGeneral(
 	if err != nil {
 		return nil, errors.Wrap(err, "DotGeneral: rhs")
 	}
+	if !lhsNode.shape.DType.IsFloat() || !rhsNode.shape.DType.IsFloat() {
+		return nil, errors.Wrapf(compute.ErrNotImplemented, "DotGeneral: MPSGraph matrixMultiplication only supports floating-point dtypes, got %s and %s", lhsNode.shape.DType, rhsNode.shape.DType)
+	}
 
 	// Compute output shape: [batch dims..., lhs cross dims..., rhs cross dims...].
 	outShape, err := dotGeneralOutputShape(
