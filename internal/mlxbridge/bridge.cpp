@@ -138,14 +138,300 @@ mlx::core::Shape toMLXShape(const int32_t* shape, int rank) {
 enum class TapeOpKind {
     Parameter,
     Constant,
+    Unary,
+    Binary,
+    ConvertDType,
+    Bitcast,
+    Iota,
 };
 
 struct TapeNode {
     TapeOpKind kind;
-    int index; // index into params or constants
+    int index = 0; // index into params or constants, or op code / iota axis
+    int32_t lhs = -1;
+    int32_t rhs = -1;
     mlx::core::Dtype dtype{mlx::core::float32};
     mlx::core::Shape shape;
 };
+
+mlx::core::Dtype toUnsignedIntDType(mlx::core::Dtype dt, int* bits) {
+    switch (dt.val()) {
+        case mlx::core::Dtype::Val::int8:
+        case mlx::core::Dtype::Val::uint8:
+            if (bits) *bits = 8;
+            return mlx::core::uint8;
+        case mlx::core::Dtype::Val::int16:
+        case mlx::core::Dtype::Val::uint16:
+            if (bits) *bits = 16;
+            return mlx::core::uint16;
+        case mlx::core::Dtype::Val::int32:
+        case mlx::core::Dtype::Val::uint32:
+            if (bits) *bits = 32;
+            return mlx::core::uint32;
+        case mlx::core::Dtype::Val::int64:
+        case mlx::core::Dtype::Val::uint64:
+            if (bits) *bits = 64;
+            return mlx::core::uint64;
+        default:
+            if (bits) *bits = 32;
+            return mlx::core::uint32;
+    }
+}
+
+bool isSignedIntDType(mlx::core::Dtype dt) {
+    switch (dt.val()) {
+        case mlx::core::Dtype::Val::int8:
+        case mlx::core::Dtype::Val::int16:
+        case mlx::core::Dtype::Val::int32:
+        case mlx::core::Dtype::Val::int64:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool isFloatDType(mlx::core::Dtype dt) {
+    switch (dt.val()) {
+        case mlx::core::Dtype::Val::float16:
+        case mlx::core::Dtype::Val::bfloat16:
+        case mlx::core::Dtype::Val::float32:
+        case mlx::core::Dtype::Val::float64:
+            return true;
+        default:
+            return false;
+    }
+}
+
+mlx::core::array evalBitCount(const mlx::core::array& a) {
+    int bits = 32;
+    mlx::core::Dtype u_dt = toUnsignedIntDType(a.dtype(), &bits);
+    mlx::core::array v = (a.dtype() == u_dt) ? a : mlx::core::astype(a, u_dt);
+
+    if (bits == 8) {
+        v = mlx::core::subtract(
+            v,
+            mlx::core::bitwise_and(
+                mlx::core::right_shift(v, mlx::core::array(uint8_t(1))),
+                mlx::core::array(uint8_t(0x55))));
+        v = mlx::core::add(
+            mlx::core::bitwise_and(v, mlx::core::array(uint8_t(0x33))),
+            mlx::core::bitwise_and(
+                mlx::core::right_shift(v, mlx::core::array(uint8_t(2))),
+                mlx::core::array(uint8_t(0x33))));
+        v = mlx::core::bitwise_and(
+            mlx::core::add(v, mlx::core::right_shift(v, mlx::core::array(uint8_t(4)))),
+            mlx::core::array(uint8_t(0x0F)));
+    } else if (bits == 16) {
+        v = mlx::core::subtract(
+            v,
+            mlx::core::bitwise_and(
+                mlx::core::right_shift(v, mlx::core::array(uint16_t(1))),
+                mlx::core::array(uint16_t(0x5555))));
+        v = mlx::core::add(
+            mlx::core::bitwise_and(v, mlx::core::array(uint16_t(0x3333))),
+            mlx::core::bitwise_and(
+                mlx::core::right_shift(v, mlx::core::array(uint16_t(2))),
+                mlx::core::array(uint16_t(0x3333))));
+        v = mlx::core::bitwise_and(
+            mlx::core::add(v, mlx::core::right_shift(v, mlx::core::array(uint16_t(4)))),
+            mlx::core::array(uint16_t(0x0F0F)));
+        v = mlx::core::bitwise_and(
+            mlx::core::add(v, mlx::core::right_shift(v, mlx::core::array(uint16_t(8)))),
+            mlx::core::array(uint16_t(0x001F)));
+    } else if (bits == 32) {
+        v = mlx::core::subtract(
+            v,
+            mlx::core::bitwise_and(
+                mlx::core::right_shift(v, mlx::core::array(uint32_t(1))),
+                mlx::core::array(uint32_t(0x55555555u))));
+        v = mlx::core::add(
+            mlx::core::bitwise_and(v, mlx::core::array(uint32_t(0x33333333u))),
+            mlx::core::bitwise_and(
+                mlx::core::right_shift(v, mlx::core::array(uint32_t(2))),
+                mlx::core::array(uint32_t(0x33333333u))));
+        v = mlx::core::bitwise_and(
+            mlx::core::add(v, mlx::core::right_shift(v, mlx::core::array(uint32_t(4)))),
+            mlx::core::array(uint32_t(0x0F0F0F0Fu)));
+        v = mlx::core::add(v, mlx::core::right_shift(v, mlx::core::array(uint32_t(8))));
+        v = mlx::core::bitwise_and(
+            mlx::core::add(v, mlx::core::right_shift(v, mlx::core::array(uint32_t(16)))),
+            mlx::core::array(uint32_t(0x0000003Fu)));
+    } else {
+        v = mlx::core::subtract(
+            v,
+            mlx::core::bitwise_and(
+                mlx::core::right_shift(v, mlx::core::array(uint64_t(1))),
+                mlx::core::array(uint64_t(0x5555555555555555ULL))));
+        v = mlx::core::add(
+            mlx::core::bitwise_and(v, mlx::core::array(uint64_t(0x3333333333333333ULL))),
+            mlx::core::bitwise_and(
+                mlx::core::right_shift(v, mlx::core::array(uint64_t(2))),
+                mlx::core::array(uint64_t(0x3333333333333333ULL))));
+        v = mlx::core::bitwise_and(
+            mlx::core::add(v, mlx::core::right_shift(v, mlx::core::array(uint64_t(4)))),
+            mlx::core::array(uint64_t(0x0F0F0F0F0F0F0F0FULL)));
+        v = mlx::core::add(v, mlx::core::right_shift(v, mlx::core::array(uint64_t(8))));
+        v = mlx::core::add(v, mlx::core::right_shift(v, mlx::core::array(uint64_t(16))));
+        v = mlx::core::bitwise_and(
+            mlx::core::add(v, mlx::core::right_shift(v, mlx::core::array(uint64_t(32)))),
+            mlx::core::array(uint64_t(0x000000000000007FULL)));
+    }
+    return (a.dtype() == u_dt) ? v : mlx::core::astype(v, a.dtype());
+}
+
+mlx::core::array evalClz(const mlx::core::array& a) {
+    int bits = 32;
+    mlx::core::Dtype u_dt = toUnsignedIntDType(a.dtype(), &bits);
+    mlx::core::array u = (a.dtype() == u_dt) ? a : mlx::core::astype(a, u_dt);
+    mlx::core::array zero = mlx::core::array(0, u_dt);
+    mlx::core::array n = mlx::core::broadcast_to(mlx::core::array(bits, u_dt), u.shape());
+
+    for (int s = bits / 2; s >= 1; s /= 2) {
+        mlx::core::array shift_arr = mlx::core::array(s, u_dt);
+        mlx::core::array y = mlx::core::right_shift(u, shift_arr);
+        mlx::core::array cond = mlx::core::not_equal(y, zero);
+        n = mlx::core::where(cond, mlx::core::subtract(n, shift_arr), n);
+        u = mlx::core::where(cond, y, u);
+    }
+    mlx::core::array res = mlx::core::subtract(n, u);
+    return (a.dtype() == u_dt) ? res : mlx::core::astype(res, a.dtype());
+}
+
+mlx::core::array evalUnaryOp(int op, const mlx::core::array& a) {
+    switch (static_cast<MLXUnaryOp>(op)) {
+        case MLX_UNARY_ABS: {
+            mlx::core::array res = mlx::core::abs(a);
+            if (a.dtype() == mlx::core::complex64 && res.dtype() != mlx::core::complex64) {
+                res = mlx::core::astype(res, mlx::core::complex64);
+            }
+            return res;
+        }
+        case MLX_UNARY_NEG:         return mlx::core::negative(a);
+        case MLX_UNARY_SQRT:        return mlx::core::sqrt(a);
+        case MLX_UNARY_RSQRT:       return mlx::core::rsqrt(a);
+        case MLX_UNARY_EXP:         return mlx::core::exp(a);
+        case MLX_UNARY_EXPM1:       return mlx::core::expm1(a);
+        case MLX_UNARY_LOG:         return mlx::core::log(a);
+        case MLX_UNARY_LOG1P:       return mlx::core::log1p(a);
+        case MLX_UNARY_SIN:         return mlx::core::sin(a);
+        case MLX_UNARY_COS:         return mlx::core::cos(a);
+        case MLX_UNARY_TANH:        return mlx::core::tanh(a);
+        case MLX_UNARY_LOGISTIC:    return mlx::core::sigmoid(a);
+        case MLX_UNARY_ERF:         return mlx::core::erf(a);
+        case MLX_UNARY_FLOOR:       return mlx::core::floor(a);
+        case MLX_UNARY_CEIL:        return mlx::core::ceil(a);
+        case MLX_UNARY_ROUND:       return mlx::core::round(a);
+        case MLX_UNARY_SIGN:        return mlx::core::sign(a);
+        case MLX_UNARY_LOGICAL_NOT: return mlx::core::logical_not(a);
+        case MLX_UNARY_BITWISE_NOT: return mlx::core::bitwise_invert(a);
+        case MLX_UNARY_IS_FINITE:
+            if (a.dtype() == mlx::core::complex64) {
+                return mlx::core::logical_and(
+                    mlx::core::isfinite(mlx::core::real(a)),
+                    mlx::core::isfinite(mlx::core::imag(a)));
+            }
+            return mlx::core::isfinite(a);
+        case MLX_UNARY_IS_NAN:
+            if (a.dtype() == mlx::core::complex64) {
+                return mlx::core::logical_or(
+                    mlx::core::isnan(mlx::core::real(a)),
+                    mlx::core::isnan(mlx::core::imag(a)));
+            }
+            return mlx::core::isnan(a);
+        case MLX_UNARY_CONJ:        return mlx::core::conjugate(a);
+        case MLX_UNARY_REAL:        return mlx::core::real(a);
+        case MLX_UNARY_IMAG:        return mlx::core::imag(a);
+        case MLX_UNARY_BIT_COUNT:   return evalBitCount(a);
+        case MLX_UNARY_CLZ:         return evalClz(a);
+        case MLX_UNARY_IDENTITY:    return a;
+    }
+    return a;
+}
+
+mlx::core::array evalIntTruncDiv(const mlx::core::array& lhs, const mlx::core::array& rhs) {
+    if (!isSignedIntDType(lhs.dtype())) {
+        return mlx::core::floor_divide(lhs, rhs);
+    }
+    mlx::core::Dtype u_dt = toUnsignedIntDType(lhs.dtype(), nullptr);
+    mlx::core::array u_lhs = mlx::core::astype(mlx::core::abs(lhs), u_dt);
+    mlx::core::array u_rhs = mlx::core::astype(mlx::core::abs(rhs), u_dt);
+    mlx::core::array q = mlx::core::astype(mlx::core::floor_divide(u_lhs, u_rhs), lhs.dtype());
+    mlx::core::array zero = mlx::core::array(0, lhs.dtype());
+    mlx::core::array diff_sign = mlx::core::not_equal(
+        mlx::core::less(lhs, zero),
+        mlx::core::less(rhs, zero));
+    return mlx::core::where(diff_sign, mlx::core::negative(q), q);
+}
+
+mlx::core::array evalBinaryOp(int op, const mlx::core::array& lhs, const mlx::core::array& rhs) {
+    switch (static_cast<MLXBinaryOp>(op)) {
+        case MLX_BINARY_ADD: return mlx::core::add(lhs, rhs);
+        case MLX_BINARY_SUB: return mlx::core::subtract(lhs, rhs);
+        case MLX_BINARY_MUL: return mlx::core::multiply(lhs, rhs);
+        case MLX_BINARY_DIV: {
+            if (isSignedIntDType(lhs.dtype()) ||
+                lhs.dtype() == mlx::core::uint8 ||
+                lhs.dtype() == mlx::core::uint16 ||
+                lhs.dtype() == mlx::core::uint32 ||
+                lhs.dtype() == mlx::core::uint64) {
+                return evalIntTruncDiv(lhs, rhs);
+            }
+            return mlx::core::divide(lhs, rhs);
+        }
+        case MLX_BINARY_REM: {
+            if (isSignedIntDType(lhs.dtype())) {
+                mlx::core::array q = evalIntTruncDiv(lhs, rhs);
+                return mlx::core::subtract(lhs, mlx::core::multiply(q, rhs));
+            }
+            if (isFloatDType(lhs.dtype())) {
+                mlx::core::array q = mlx::core::divide(lhs, rhs);
+                mlx::core::array zero = mlx::core::array(0.0f, lhs.dtype());
+                mlx::core::array trunc_q = mlx::core::where(
+                    mlx::core::greater_equal(q, zero),
+                    mlx::core::floor(q),
+                    mlx::core::ceil(q));
+                return mlx::core::subtract(lhs, mlx::core::multiply(trunc_q, rhs));
+            }
+            return mlx::core::remainder(lhs, rhs);
+        }
+        case MLX_BINARY_POW:         return mlx::core::power(lhs, rhs);
+        case MLX_BINARY_MAX:         return mlx::core::maximum(lhs, rhs);
+        case MLX_BINARY_MIN:         return mlx::core::minimum(lhs, rhs);
+        case MLX_BINARY_ATAN2:       return mlx::core::arctan2(lhs, rhs);
+        case MLX_BINARY_LOGICAL_AND: return mlx::core::logical_and(lhs, rhs);
+        case MLX_BINARY_LOGICAL_OR:  return mlx::core::logical_or(lhs, rhs);
+        case MLX_BINARY_LOGICAL_XOR: return mlx::core::logical_xor(lhs, rhs);
+        case MLX_BINARY_BITWISE_AND: return mlx::core::bitwise_and(lhs, rhs);
+        case MLX_BINARY_BITWISE_OR:  return mlx::core::bitwise_or(lhs, rhs);
+        case MLX_BINARY_BITWISE_XOR: return mlx::core::bitwise_xor(lhs, rhs);
+        case MLX_BINARY_SHIFT_LEFT:  return mlx::core::left_shift(lhs, rhs);
+        case MLX_BINARY_SHIFT_RIGHT_ARITHMETIC:
+            return mlx::core::right_shift(lhs, rhs);
+        case MLX_BINARY_SHIFT_RIGHT_LOGICAL: {
+            if (isSignedIntDType(lhs.dtype())) {
+                mlx::core::Dtype u_dt = toUnsignedIntDType(lhs.dtype(), nullptr);
+                mlx::core::array u_lhs = mlx::core::astype(lhs, u_dt);
+                mlx::core::array u_rhs = mlx::core::astype(rhs, u_dt);
+                return mlx::core::astype(mlx::core::right_shift(u_lhs, u_rhs), lhs.dtype());
+            }
+            return mlx::core::right_shift(lhs, rhs);
+        }
+        case MLX_BINARY_COMPLEX: {
+            mlx::core::array re = mlx::core::astype(lhs, mlx::core::complex64);
+            mlx::core::array im = mlx::core::multiply(
+                mlx::core::array(mlx::core::complex64_t{0.0f, 1.0f}),
+                mlx::core::astype(rhs, mlx::core::complex64));
+            return mlx::core::add(re, im);
+        }
+        case MLX_BINARY_EQUAL:            return mlx::core::equal(lhs, rhs);
+        case MLX_BINARY_NOT_EQUAL:        return mlx::core::not_equal(lhs, rhs);
+        case MLX_BINARY_LESS_THAN:        return mlx::core::less(lhs, rhs);
+        case MLX_BINARY_LESS_OR_EQUAL:    return mlx::core::less_equal(lhs, rhs);
+        case MLX_BINARY_GREATER_THAN:     return mlx::core::greater(lhs, rhs);
+        case MLX_BINARY_GREATER_OR_EQUAL: return mlx::core::greater_equal(lhs, rhs);
+    }
+    return lhs;
+}
 
 struct MLXTape {
     int num_params = 0;
@@ -169,14 +455,65 @@ struct MLXTape {
                 case TapeOpKind::Constant:
                     values.push_back(constants.at(node.index));
                     break;
+                case TapeOpKind::Unary:
+                    values.push_back(evalUnaryOp(node.index, values.at(node.lhs)));
+                    break;
+                case TapeOpKind::Binary:
+                    values.push_back(evalBinaryOp(node.index, values.at(node.lhs), values.at(node.rhs)));
+                    break;
+                case TapeOpKind::ConvertDType:
+                    values.push_back(mlx::core::astype(values.at(node.lhs), node.dtype));
+                    break;
+                case TapeOpKind::Bitcast: {
+                    mlx::core::array a = values.at(node.lhs);
+                    if (!a.flags().row_contiguous) {
+                        a = mlx::core::contiguous(a);
+                    }
+                    if (a.ndim() == 0 && node.dtype.size() != a.dtype().size()) {
+                        a = mlx::core::reshape(a, {1});
+                    }
+                    mlx::core::array v = mlx::core::view(a, node.dtype);
+                    if (v.shape() != node.shape) {
+                        v = mlx::core::reshape(v, node.shape);
+                    }
+                    values.push_back(std::move(v));
+                    break;
+                }
+                case TapeOpKind::Iota: {
+                    int rank = static_cast<int>(node.shape.size());
+                    int axis = node.index;
+                    int32_t dim = node.shape[axis];
+                    mlx::core::array r = (node.dtype == mlx::core::complex64)
+                        ? mlx::core::astype(mlx::core::arange(static_cast<double>(dim), mlx::core::float32), mlx::core::complex64)
+                        : mlx::core::arange(static_cast<double>(dim), node.dtype);
+                    if (rank > 1) {
+                        mlx::core::Shape reshape_dims(rank, 1);
+                        reshape_dims[axis] = dim;
+                        r = mlx::core::reshape(r, std::move(reshape_dims));
+                        r = mlx::core::broadcast_to(r, node.shape);
+                    }
+                    values.push_back(std::move(r));
+                    break;
+                }
             }
         }
 
         std::vector<mlx::core::array> outputs;
         outputs.reserve(output_ids.size());
-        for (int32_t id : output_ids) {
+        for (size_t i = 0; i < output_ids.size(); ++i) {
+            int32_t id = output_ids[i];
             mlx::core::array out = values.at(id);
-            if (eager_contiguous) {
+            bool is_dup = false;
+            for (size_t j = 0; j < i; ++j) {
+                if (output_ids[j] == id) {
+                    is_dup = true;
+                    break;
+                }
+            }
+            const auto& node = nodes.at(id);
+            if (node.kind == TapeOpKind::Parameter || node.kind == TapeOpKind::Constant || is_dup) {
+                out = mlx::core::copy(out);
+            } else if (eager_contiguous) {
                 out = mlx::core::contiguous(out);
             }
             outputs.push_back(std::move(out));
@@ -408,6 +745,8 @@ int32_t mlx_tape_add_parameter(MLXTapeHandle handle, int dtype,
     tape->nodes.push_back(TapeNode{
         TapeOpKind::Parameter,
         param_idx,
+        -1,
+        -1,
         dt,
         std::move(s),
     });
@@ -442,6 +781,8 @@ int32_t mlx_tape_add_constant(MLXTapeHandle handle, const void* src, int64_t nby
         tape->nodes.push_back(TapeNode{
             TapeOpKind::Constant,
             const_idx,
+            -1,
+            -1,
             dt,
             std::move(s),
         });
@@ -450,6 +791,140 @@ int32_t mlx_tape_add_constant(MLXTapeHandle handle, const void* src, int64_t nby
         setError(error, 4, std::string("mlx_tape_add_constant: ") + e.what());
         return -1;
     }
+}
+
+int32_t mlx_tape_add_unary(MLXTapeHandle handle, int op, int32_t input, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_unary: null tape handle");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    if (input < 0 || static_cast<size_t>(input) >= tape->nodes.size()) {
+        setError(error, 2, "mlx_tape_add_unary: invalid input node ID");
+        return -1;
+    }
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    tape->nodes.push_back(TapeNode{
+        TapeOpKind::Unary,
+        op,
+        input,
+        -1,
+        mlx::core::float32,
+        {},
+    });
+    return node_id;
+}
+
+int32_t mlx_tape_add_binary(MLXTapeHandle handle, int op, int32_t lhs, int32_t rhs, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_binary: null tape handle");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    if (lhs < 0 || static_cast<size_t>(lhs) >= tape->nodes.size() ||
+        rhs < 0 || static_cast<size_t>(rhs) >= tape->nodes.size()) {
+        setError(error, 2, "mlx_tape_add_binary: invalid operand node ID");
+        return -1;
+    }
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    tape->nodes.push_back(TapeNode{
+        TapeOpKind::Binary,
+        op,
+        lhs,
+        rhs,
+        mlx::core::float32,
+        {},
+    });
+    return node_id;
+}
+
+int32_t mlx_tape_add_convert_dtype(MLXTapeHandle handle, int32_t input, int target_dtype, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_convert_dtype: null tape handle");
+        return -1;
+    }
+    bool ok = false;
+    mlx::core::Dtype dt = toMLXDType(target_dtype, &ok);
+    if (!ok) {
+        setError(error, 3, "mlx_tape_add_convert_dtype: unsupported target dtype");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    if (input < 0 || static_cast<size_t>(input) >= tape->nodes.size()) {
+        setError(error, 2, "mlx_tape_add_convert_dtype: invalid input node ID");
+        return -1;
+    }
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    tape->nodes.push_back(TapeNode{
+        TapeOpKind::ConvertDType,
+        0,
+        input,
+        -1,
+        dt,
+        {},
+    });
+    return node_id;
+}
+
+int32_t mlx_tape_add_bitcast(MLXTapeHandle handle, int32_t input, int target_dtype,
+    const int32_t* out_shape, int out_rank, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_bitcast: null tape handle");
+        return -1;
+    }
+    bool ok = false;
+    mlx::core::Dtype dt = toMLXDType(target_dtype, &ok);
+    if (!ok) {
+        setError(error, 3, "mlx_tape_add_bitcast: unsupported target dtype");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    if (input < 0 || static_cast<size_t>(input) >= tape->nodes.size()) {
+        setError(error, 2, "mlx_tape_add_bitcast: invalid input node ID");
+        return -1;
+    }
+    mlx::core::Shape s = toMLXShape(out_shape, out_rank);
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    tape->nodes.push_back(TapeNode{
+        TapeOpKind::Bitcast,
+        0,
+        input,
+        -1,
+        dt,
+        std::move(s),
+    });
+    return node_id;
+}
+
+int32_t mlx_tape_add_iota(MLXTapeHandle handle, int dtype,
+    const int32_t* shape, int rank, int iota_axis, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_iota: null tape handle");
+        return -1;
+    }
+    bool ok = false;
+    mlx::core::Dtype dt = toMLXDType(dtype, &ok);
+    if (!ok) {
+        setError(error, 3, "mlx_tape_add_iota: unsupported dtype");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    mlx::core::Shape s = toMLXShape(shape, rank);
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    tape->nodes.push_back(TapeNode{
+        TapeOpKind::Iota,
+        iota_axis,
+        -1,
+        -1,
+        dt,
+        std::move(s),
+    });
+    return node_id;
 }
 
 MLXExecHandle mlx_tape_compile(MLXTapeHandle handle,
@@ -601,6 +1076,31 @@ int32_t mlx_tape_add_parameter(MLXTapeHandle, int, const int32_t*, int, MLXError
 }
 
 int32_t mlx_tape_add_constant(MLXTapeHandle, const void*, int64_t, int, const int32_t*, int, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_unary(MLXTapeHandle, int, int32_t, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_binary(MLXTapeHandle, int, int32_t, int32_t, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_convert_dtype(MLXTapeHandle, int32_t, int, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_bitcast(MLXTapeHandle, int32_t, int, const int32_t*, int, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_iota(MLXTapeHandle, int, const int32_t*, int, int, MLXError* error) {
     setError(error, 1, kInstallHelpMsg);
     return -1;
 }

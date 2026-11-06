@@ -40,6 +40,70 @@ const (
 	DTypeComplex64 DType = C.MLX_DTYPE_COMPLEX64
 )
 
+// UnaryOp mirrors the MLXUnaryOp enum in bridge.h.
+type UnaryOp = int
+
+const (
+	UnaryAbs        UnaryOp = C.MLX_UNARY_ABS
+	UnaryNeg        UnaryOp = C.MLX_UNARY_NEG
+	UnarySqrt       UnaryOp = C.MLX_UNARY_SQRT
+	UnaryRsqrt      UnaryOp = C.MLX_UNARY_RSQRT
+	UnaryExp        UnaryOp = C.MLX_UNARY_EXP
+	UnaryExpm1      UnaryOp = C.MLX_UNARY_EXPM1
+	UnaryLog        UnaryOp = C.MLX_UNARY_LOG
+	UnaryLog1p      UnaryOp = C.MLX_UNARY_LOG1P
+	UnarySin        UnaryOp = C.MLX_UNARY_SIN
+	UnaryCos        UnaryOp = C.MLX_UNARY_COS
+	UnaryTanh       UnaryOp = C.MLX_UNARY_TANH
+	UnaryLogistic   UnaryOp = C.MLX_UNARY_LOGISTIC
+	UnaryErf        UnaryOp = C.MLX_UNARY_ERF
+	UnaryFloor      UnaryOp = C.MLX_UNARY_FLOOR
+	UnaryCeil       UnaryOp = C.MLX_UNARY_CEIL
+	UnaryRound      UnaryOp = C.MLX_UNARY_ROUND
+	UnarySign       UnaryOp = C.MLX_UNARY_SIGN
+	UnaryLogicalNot UnaryOp = C.MLX_UNARY_LOGICAL_NOT
+	UnaryBitwiseNot UnaryOp = C.MLX_UNARY_BITWISE_NOT
+	UnaryIsFinite   UnaryOp = C.MLX_UNARY_IS_FINITE
+	UnaryIsNaN      UnaryOp = C.MLX_UNARY_IS_NAN
+	UnaryConj       UnaryOp = C.MLX_UNARY_CONJ
+	UnaryReal       UnaryOp = C.MLX_UNARY_REAL
+	UnaryImag       UnaryOp = C.MLX_UNARY_IMAG
+	UnaryBitCount   UnaryOp = C.MLX_UNARY_BIT_COUNT
+	UnaryClz        UnaryOp = C.MLX_UNARY_CLZ
+	UnaryIdentity   UnaryOp = C.MLX_UNARY_IDENTITY
+)
+
+// BinaryOp mirrors the MLXBinaryOp enum in bridge.h.
+type BinaryOp = int
+
+const (
+	BinaryAdd                  BinaryOp = C.MLX_BINARY_ADD
+	BinarySub                  BinaryOp = C.MLX_BINARY_SUB
+	BinaryMul                  BinaryOp = C.MLX_BINARY_MUL
+	BinaryDiv                  BinaryOp = C.MLX_BINARY_DIV
+	BinaryRem                  BinaryOp = C.MLX_BINARY_REM
+	BinaryPow                  BinaryOp = C.MLX_BINARY_POW
+	BinaryMax                  BinaryOp = C.MLX_BINARY_MAX
+	BinaryMin                  BinaryOp = C.MLX_BINARY_MIN
+	BinaryAtan2                BinaryOp = C.MLX_BINARY_ATAN2
+	BinaryLogicalAnd           BinaryOp = C.MLX_BINARY_LOGICAL_AND
+	BinaryLogicalOr            BinaryOp = C.MLX_BINARY_LOGICAL_OR
+	BinaryLogicalXor           BinaryOp = C.MLX_BINARY_LOGICAL_XOR
+	BinaryBitwiseAnd           BinaryOp = C.MLX_BINARY_BITWISE_AND
+	BinaryBitwiseOr            BinaryOp = C.MLX_BINARY_BITWISE_OR
+	BinaryBitwiseXor           BinaryOp = C.MLX_BINARY_BITWISE_XOR
+	BinaryShiftLeft            BinaryOp = C.MLX_BINARY_SHIFT_LEFT
+	BinaryShiftRightArithmetic BinaryOp = C.MLX_BINARY_SHIFT_RIGHT_ARITHMETIC
+	BinaryShiftRightLogical    BinaryOp = C.MLX_BINARY_SHIFT_RIGHT_LOGICAL
+	BinaryComplex              BinaryOp = C.MLX_BINARY_COMPLEX
+	BinaryEqual                BinaryOp = C.MLX_BINARY_EQUAL
+	BinaryNotEqual             BinaryOp = C.MLX_BINARY_NOT_EQUAL
+	BinaryLessThan             BinaryOp = C.MLX_BINARY_LESS_THAN
+	BinaryLessOrEqual          BinaryOp = C.MLX_BINARY_LESS_OR_EQUAL
+	BinaryGreaterThan          BinaryOp = C.MLX_BINARY_GREATER_THAN
+	BinaryGreaterOrEqual       BinaryOp = C.MLX_BINARY_GREATER_OR_EQUAL
+)
+
 // ArrayHandle is an opaque uintptr handle to a C++ mlx::core::array*.
 type ArrayHandle uintptr
 
@@ -265,6 +329,60 @@ func (t *Tape) AddConstant(data unsafe.Pointer, nbytes int64, dtype DType, shape
 	var cErr C.MLXError
 	shapePtr, rank, cShape := toInt32Shape(shape)
 	id := C.mlx_tape_add_constant(t.handle, data, C.int64_t(nbytes), C.int(dtype), shapePtr, rank, &cErr)
+	runtime.KeepAlive(cShape)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddUnary records a unary operation in the tape.
+func (t *Tape) AddUnary(op UnaryOp, input NodeID) (NodeID, error) {
+	var cErr C.MLXError
+	id := C.mlx_tape_add_unary(t.handle, C.int(op), C.int32_t(input), &cErr)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddBinary records a binary or comparison operation in the tape.
+func (t *Tape) AddBinary(op BinaryOp, lhs, rhs NodeID) (NodeID, error) {
+	var cErr C.MLXError
+	id := C.mlx_tape_add_binary(t.handle, C.int(op), C.int32_t(lhs), C.int32_t(rhs), &cErr)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddConvertDType records a dtype conversion (astype) in the tape.
+func (t *Tape) AddConvertDType(input NodeID, targetDType DType) (NodeID, error) {
+	var cErr C.MLXError
+	id := C.mlx_tape_add_convert_dtype(t.handle, C.int32_t(input), C.int(targetDType), &cErr)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddBitcast records a bitcast (view + reshape) in the tape.
+func (t *Tape) AddBitcast(input NodeID, targetDType DType, outShape []int) (NodeID, error) {
+	var cErr C.MLXError
+	shapePtr, rank, cShape := toInt32Shape(outShape)
+	id := C.mlx_tape_add_bitcast(t.handle, C.int32_t(input), C.int(targetDType), shapePtr, rank, &cErr)
+	runtime.KeepAlive(cShape)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddIota records an Iota operation in the tape.
+func (t *Tape) AddIota(dtype DType, shape []int, iotaAxis int) (NodeID, error) {
+	var cErr C.MLXError
+	shapePtr, rank, cShape := toInt32Shape(shape)
+	id := C.mlx_tape_add_iota(t.handle, C.int(dtype), shapePtr, rank, C.int(iotaAxis), &cErr)
 	runtime.KeepAlive(cShape)
 	if err := extractError(cErr); err != nil {
 		return -1, err

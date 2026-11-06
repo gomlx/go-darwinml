@@ -42,6 +42,66 @@ typedef enum {
     MLX_DTYPE_COMPLEX64 = 13,
 } MLXDType;
 
+// Unary operation types recorded in an MLXTape.
+typedef enum {
+    MLX_UNARY_ABS         = 0,
+    MLX_UNARY_NEG         = 1,
+    MLX_UNARY_SQRT        = 2,
+    MLX_UNARY_RSQRT       = 3,
+    MLX_UNARY_EXP         = 4,
+    MLX_UNARY_EXPM1       = 5,
+    MLX_UNARY_LOG         = 6,
+    MLX_UNARY_LOG1P       = 7,
+    MLX_UNARY_SIN         = 8,
+    MLX_UNARY_COS         = 9,
+    MLX_UNARY_TANH        = 10,
+    MLX_UNARY_LOGISTIC    = 11,
+    MLX_UNARY_ERF         = 12,
+    MLX_UNARY_FLOOR       = 13,
+    MLX_UNARY_CEIL        = 14,
+    MLX_UNARY_ROUND       = 15,
+    MLX_UNARY_SIGN        = 16,
+    MLX_UNARY_LOGICAL_NOT = 17,
+    MLX_UNARY_BITWISE_NOT = 18,
+    MLX_UNARY_IS_FINITE   = 19,
+    MLX_UNARY_IS_NAN      = 20,
+    MLX_UNARY_CONJ        = 21,
+    MLX_UNARY_REAL        = 22,
+    MLX_UNARY_IMAG        = 23,
+    MLX_UNARY_BIT_COUNT   = 24,
+    MLX_UNARY_CLZ         = 25,
+    MLX_UNARY_IDENTITY    = 26,
+} MLXUnaryOp;
+
+// Binary and comparison operation types recorded in an MLXTape.
+typedef enum {
+    MLX_BINARY_ADD                    = 0,
+    MLX_BINARY_SUB                    = 1,
+    MLX_BINARY_MUL                    = 2,
+    MLX_BINARY_DIV                    = 3,
+    MLX_BINARY_REM                    = 4,
+    MLX_BINARY_POW                    = 5,
+    MLX_BINARY_MAX                    = 6,
+    MLX_BINARY_MIN                    = 7,
+    MLX_BINARY_ATAN2                  = 8,
+    MLX_BINARY_LOGICAL_AND            = 9,
+    MLX_BINARY_LOGICAL_OR             = 10,
+    MLX_BINARY_LOGICAL_XOR            = 11,
+    MLX_BINARY_BITWISE_AND            = 12,
+    MLX_BINARY_BITWISE_OR             = 13,
+    MLX_BINARY_BITWISE_XOR            = 14,
+    MLX_BINARY_SHIFT_LEFT             = 15,
+    MLX_BINARY_SHIFT_RIGHT_ARITHMETIC = 16,
+    MLX_BINARY_SHIFT_RIGHT_LOGICAL    = 17,
+    MLX_BINARY_COMPLEX                = 18,
+    MLX_BINARY_EQUAL                  = 19,
+    MLX_BINARY_NOT_EQUAL              = 20,
+    MLX_BINARY_LESS_THAN              = 21,
+    MLX_BINARY_LESS_OR_EQUAL          = 22,
+    MLX_BINARY_GREATER_THAN           = 23,
+    MLX_BINARY_GREATER_OR_EQUAL       = 24,
+} MLXBinaryOp;
+
 // --- Initialization & Device Info ---
 
 // Initializes the MLX bridge, dynamically verifying that libmlx.dylib is installed
@@ -100,6 +160,23 @@ int32_t mlx_tape_add_parameter(MLXTapeHandle tape, int dtype,
 // Materializes a constant array in unified memory owned by the tape and returns its node ID (>= 0), or -1 on error.
 int32_t mlx_tape_add_constant(MLXTapeHandle tape, const void* data, int64_t nbytes,
     int dtype, const int32_t* shape, int rank, MLXError* error);
+
+// Records a unary operation (MLXUnaryOp) on input node ID.
+int32_t mlx_tape_add_unary(MLXTapeHandle tape, int op, int32_t input, MLXError* error);
+
+// Records a binary or comparison operation (MLXBinaryOp) on lhs and rhs node IDs.
+int32_t mlx_tape_add_binary(MLXTapeHandle tape, int op, int32_t lhs, int32_t rhs, MLXError* error);
+
+// Records a dtype conversion (astype) on input node ID.
+int32_t mlx_tape_add_convert_dtype(MLXTapeHandle tape, int32_t input, int target_dtype, MLXError* error);
+
+// Records a bitcast (view + reshape) on input node ID to target_dtype and out_shape.
+int32_t mlx_tape_add_bitcast(MLXTapeHandle tape, int32_t input, int target_dtype,
+    const int32_t* out_shape, int out_rank, MLXError* error);
+
+// Records an Iota operation generating [0, 1, ..., dim-1] along iota_axis broadcast to shape.
+int32_t mlx_tape_add_iota(MLXTapeHandle tape, int dtype,
+    const int32_t* shape, int rank, int iota_axis, MLXError* error);
 
 // Compiles a tape into an executable.
 // If compile_graph is true, traces and compiles the tape with mlx::core::compile.
