@@ -12,8 +12,6 @@ import (
 
 	"github.com/gomlx/compute"
 	"github.com/gomlx/compute/dtypes"
-	"github.com/gomlx/compute/dtypes/bfloat16"
-	"github.com/gomlx/compute/dtypes/float16"
 	"github.com/gomlx/compute/shapes"
 	"github.com/gomlx/go-darwinml/internal/bridge"
 	"github.com/pkg/errors"
@@ -38,76 +36,10 @@ var _ compute.Buffer = (*gpuBuffer)(nil)
 // makeTypedSlice creates a typed Go slice backed directly by ptr with length size.
 // If size == 0, ptr may be nil and an empty typed slice is returned.
 func makeTypedSlice(dt dtypes.DType, ptr unsafe.Pointer, size int) any {
-	switch dt {
-	case dtypes.Bool:
-		if size == 0 {
-			return []bool{}
-		}
-		return unsafe.Slice((*bool)(ptr), size)
-	case dtypes.Int8:
-		if size == 0 {
-			return []int8{}
-		}
-		return unsafe.Slice((*int8)(ptr), size)
-	case dtypes.Int16:
-		if size == 0 {
-			return []int16{}
-		}
-		return unsafe.Slice((*int16)(ptr), size)
-	case dtypes.Int32:
-		if size == 0 {
-			return []int32{}
-		}
-		return unsafe.Slice((*int32)(ptr), size)
-	case dtypes.Int64:
-		if size == 0 {
-			return []int64{}
-		}
-		return unsafe.Slice((*int64)(ptr), size)
-	case dtypes.Uint8:
-		if size == 0 {
-			return []uint8{}
-		}
-		return unsafe.Slice((*uint8)(ptr), size)
-	case dtypes.Uint16:
-		if size == 0 {
-			return []uint16{}
-		}
-		return unsafe.Slice((*uint16)(ptr), size)
-	case dtypes.Uint32:
-		if size == 0 {
-			return []uint32{}
-		}
-		return unsafe.Slice((*uint32)(ptr), size)
-	case dtypes.Uint64:
-		if size == 0 {
-			return []uint64{}
-		}
-		return unsafe.Slice((*uint64)(ptr), size)
-	case dtypes.Float16:
-		if size == 0 {
-			return []float16.Float16{}
-		}
-		return unsafe.Slice((*float16.Float16)(ptr), size)
-	case dtypes.BFloat16:
-		if size == 0 {
-			return []bfloat16.BFloat16{}
-		}
-		return unsafe.Slice((*bfloat16.BFloat16)(ptr), size)
-	case dtypes.Float32:
-		if size == 0 {
-			return []float32{}
-		}
-		return unsafe.Slice((*float32)(ptr), size)
-	case dtypes.Float64:
-		if size == 0 {
-			return []float64{}
-		}
-		return unsafe.Slice((*float64)(ptr), size)
-	default:
-		goType := dt.GoType()
-		return reflect.MakeSlice(reflect.SliceOf(goType), size, size).Interface()
+	if size == 0 || ptr == nil {
+		return dtypes.MakeAnySlice(dt, size)
 	}
+	return dtypes.UnsafeAnySliceFromBytes(ptr, dt, size)
 }
 
 // newBuffer allocates a new MTLBuffer-backed shared buffer for the given shape.
@@ -246,19 +178,7 @@ func (b *Backend) bufferFromFlat(flat any, shape shapes.Shape) (*gpuBuffer, erro
 
 // copyFlat copies data between two flat slices of the same type and length.
 func copyFlat(dst, src any) error {
-	dstVal := reflect.ValueOf(dst)
-	srcVal := reflect.ValueOf(src)
-	if dstVal.Kind() != reflect.Slice || srcVal.Kind() != reflect.Slice {
-		return errors.Errorf("copyFlat: expected slices, got dst=%T src=%T", dst, src)
-	}
-	if dstVal.Type().Elem() != srcVal.Type().Elem() {
-		return errors.Errorf("copyFlat: type mismatch dst=%v src=%v", dstVal.Type().Elem(), srcVal.Type().Elem())
-	}
-	if dstVal.Len() != srcVal.Len() {
-		return errors.Errorf("copyFlat: length mismatch dst=%d src=%d", dstVal.Len(), srcVal.Len())
-	}
-	reflect.Copy(dstVal, srcVal)
-	return nil
+	return dtypes.SafeCopyAnySlice(dst, src)
 }
 
 // checkDTypeSupported returns compute.ErrNotImplemented if dt is not supported by the MPS backend.
