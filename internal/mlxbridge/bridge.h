@@ -122,6 +122,13 @@ typedef enum {
     MLX_CUMULATIVE_MAX = 1,
 } MLXCumulativeOp;
 
+// Scatter reduction operation types recorded in an MLXTape.
+typedef enum {
+    MLX_SCATTER_SUM = 0,
+    MLX_SCATTER_MAX = 1,
+    MLX_SCATTER_MIN = 2,
+} MLXScatterOp;
+
 // --- Initialization & Device Info ---
 
 // Initializes the MLX bridge, dynamically verifying that libmlx.dylib is installed
@@ -247,6 +254,69 @@ int32_t mlx_tape_add_cumulative(MLXTapeHandle tape, int op, int32_t input,
 
 // Records a matrix multiplication (matmul) on lhs and rhs node IDs.
 int32_t mlx_tape_add_matmul(MLXTapeHandle tape, int32_t lhs, int32_t rhs, MLXError* error);
+
+// Records a sub-function parameter placeholder node (does not add a main graph input parameter).
+int32_t mlx_tape_add_sub_parameter(MLXTapeHandle tape, int dtype,
+    const int32_t* shape, int rank, MLXError* error);
+
+// Inlines a recorded sub-function into the tape by cloning nodes reachable from output_ids
+// and substituting arg_ids[i] for param_ids[i]. Writes cloned output node IDs into out_cloned_ids.
+bool mlx_tape_inline(MLXTapeHandle tape,
+    const int32_t* param_ids, const int32_t* arg_ids, int num_params,
+    const int32_t* output_ids, int num_outputs, int32_t* out_cloned_ids, MLXError* error);
+
+// Records a Gather operation wrapping mlx::core::gather.
+int32_t mlx_tape_add_gather(MLXTapeHandle tape, int32_t operand, int32_t start_indices,
+    int index_vector_axis, const int32_t* start_index_map, int num_index_map,
+    const int32_t* slice_sizes, int operand_rank, MLXError* error);
+
+// Records a Scatter operation (MLXScatterOp: sum, max, or min) wrapping mlx::core::scatter_*.
+int32_t mlx_tape_add_scatter(MLXTapeHandle tape, int op,
+    int32_t operand, int32_t indices, int32_t updates,
+    int index_vector_axis, const int32_t* axes, int num_axes, MLXError* error);
+
+// Records a DynamicSlice operation with XLA start-index clamping.
+int32_t mlx_tape_add_dynamic_slice(MLXTapeHandle tape, int32_t operand, int32_t start_indices,
+    const int32_t* slice_sizes, int rank, MLXError* error);
+
+// Records a DynamicUpdateSlice operation with XLA start-index clamping.
+int32_t mlx_tape_add_dynamic_update_slice(MLXTapeHandle tape, int32_t operand, int32_t update,
+    int32_t start_indices, int rank, MLXError* error);
+
+// Records a general N-D convolution wrapping mlx::core::conv_general (channels-last layout).
+int32_t mlx_tape_add_conv_general(MLXTapeHandle tape, int32_t input, int32_t weight,
+    const int32_t* strides, const int32_t* pad_lo, const int32_t* pad_hi,
+    const int32_t* kernel_dilations, const int32_t* input_dilations,
+    int num_spatial_dims, int groups, MLXError* error);
+
+// Records an as_strided view over a contiguous copy of input.
+int32_t mlx_tape_add_as_strided(MLXTapeHandle tape, int32_t input,
+    const int32_t* shape, const int64_t* strides, int rank, int64_t offset, MLXError* error);
+
+// Records a general N-D SelectAndScatterMax or SelectAndScatterMin operation.
+int32_t mlx_tape_add_select_and_scatter(MLXTapeHandle tape, int32_t operand, int32_t source,
+    bool is_max, const int32_t* window_dims, const int32_t* window_strides,
+    const int32_t* pad_lo, const int32_t* pad_hi, int rank, MLXError* error);
+
+// Records an RNGBitGenerator operation returning both new_state and generated values node IDs.
+bool mlx_tape_add_rng_bit_generator(MLXTapeHandle tape, int32_t state, int dtype,
+    const int32_t* shape, int rank, int32_t* out_new_state, int32_t* out_values, MLXError* error);
+
+// Records a Sort operation along axis.
+int32_t mlx_tape_add_sort(MLXTapeHandle tape, int32_t input, int axis, MLXError* error);
+
+// Records an Argsort operation along axis (returns uint32 indices).
+int32_t mlx_tape_add_argsort(MLXTapeHandle tape, int32_t input, int axis, MLXError* error);
+
+// Records a take_along_axis operation along axis.
+int32_t mlx_tape_add_take_along_axis(MLXTapeHandle tape, int32_t input, int32_t indices, int axis, MLXError* error);
+
+// Records a precise Softmax operation along axis.
+int32_t mlx_tape_add_softmax(MLXTapeHandle tape, int32_t input, int axis, MLXError* error);
+
+// Records a fast LayerNorm operation over the last axis (gamma and beta may be -1 if nil).
+int32_t mlx_tape_add_layer_norm(MLXTapeHandle tape, int32_t input, int32_t gamma, int32_t beta,
+    float eps, MLXError* error);
 
 // Compiles a tape into an executable.
 // If compile_graph is true, traces and compiles the tape with mlx::core::compile.

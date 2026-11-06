@@ -128,6 +128,15 @@ const (
 	CumulativeMax CumulativeOp = C.MLX_CUMULATIVE_MAX
 )
 
+// ScatterOp mirrors the MLXScatterOp enum in bridge.h.
+type ScatterOp = int
+
+const (
+	ScatterSum ScatterOp = C.MLX_SCATTER_SUM
+	ScatterMax ScatterOp = C.MLX_SCATTER_MAX
+	ScatterMin ScatterOp = C.MLX_SCATTER_MIN
+)
+
 // ArrayHandle is an opaque uintptr handle to a C++ mlx::core::array*.
 type ArrayHandle uintptr
 
@@ -571,6 +580,236 @@ func (t *Tape) AddCumulative(op CumulativeOp, input NodeID, axis int, reverse, e
 func (t *Tape) AddMatmul(lhs, rhs NodeID) (NodeID, error) {
 	var cErr C.MLXError
 	id := C.mlx_tape_add_matmul(t.handle, C.int32_t(lhs), C.int32_t(rhs), &cErr)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddSubParameter records a sub-function parameter placeholder node in the tape.
+func (t *Tape) AddSubParameter(dtype DType, shape []int) (NodeID, error) {
+	var cErr C.MLXError
+	shapePtr, rank, cShape := toInt32Shape(shape)
+	id := C.mlx_tape_add_sub_parameter(t.handle, C.int(dtype), shapePtr, rank, &cErr)
+	runtime.KeepAlive(cShape)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// Inline clones the subgraph reachable from outputIDs, substituting argIDs[i] for paramIDs[i].
+func (t *Tape) Inline(paramIDs, argIDs, outputIDs []NodeID) ([]NodeID, error) {
+	var cErr C.MLXError
+	var pPtr, aPtr, oPtr, cPtr *C.int32_t
+	cParams := make([]C.int32_t, len(paramIDs))
+	cArgs := make([]C.int32_t, len(argIDs))
+	for i := range paramIDs {
+		cParams[i] = C.int32_t(paramIDs[i])
+		cArgs[i] = C.int32_t(argIDs[i])
+	}
+	if len(cParams) > 0 {
+		pPtr = &cParams[0]
+		aPtr = &cArgs[0]
+	}
+	cOuts := make([]C.int32_t, len(outputIDs))
+	cCloned := make([]C.int32_t, len(outputIDs))
+	for i, id := range outputIDs {
+		cOuts[i] = C.int32_t(id)
+	}
+	if len(cOuts) > 0 {
+		oPtr = &cOuts[0]
+		cPtr = &cCloned[0]
+	}
+	ok := C.mlx_tape_inline(t.handle, pPtr, aPtr, C.int(len(cParams)), oPtr, C.int(len(cOuts)), cPtr, &cErr)
+	runtime.KeepAlive(cParams)
+	runtime.KeepAlive(cArgs)
+	runtime.KeepAlive(cOuts)
+	if !ok {
+		if err := extractError(cErr); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("mlx: inline failed")
+	}
+	res := make([]NodeID, len(cCloned))
+	for i, id := range cCloned {
+		res[i] = NodeID(id)
+	}
+	return res, nil
+}
+
+// AddGather records a Gather operation in the tape.
+func (t *Tape) AddGather(operand, startIndices NodeID, indexVectorAxis int, startIndexMap, sliceSizes []int) (NodeID, error) {
+	var cErr C.MLXError
+	mapPtr, mapLen, cMap := toInt32Shape(startIndexMap)
+	slicePtr, opRank, cSlices := toInt32Shape(sliceSizes)
+	id := C.mlx_tape_add_gather(t.handle, C.int32_t(operand), C.int32_t(startIndices),
+		C.int(indexVectorAxis), mapPtr, mapLen, slicePtr, opRank, &cErr)
+	runtime.KeepAlive(cMap)
+	runtime.KeepAlive(cSlices)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddScatter records a Scatter operation in the tape.
+func (t *Tape) AddScatter(op ScatterOp, operand, indices, updates NodeID, indexVectorAxis int, axes []int) (NodeID, error) {
+	var cErr C.MLXError
+	axesPtr, axesLen, cAxes := toInt32Shape(axes)
+	id := C.mlx_tape_add_scatter(t.handle, C.int(op), C.int32_t(operand), C.int32_t(indices), C.int32_t(updates),
+		C.int(indexVectorAxis), axesPtr, axesLen, &cErr)
+	runtime.KeepAlive(cAxes)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddDynamicSlice records a DynamicSlice operation in the tape.
+func (t *Tape) AddDynamicSlice(operand, startIndices NodeID, sliceSizes []int) (NodeID, error) {
+	var cErr C.MLXError
+	slicePtr, rank, cSlices := toInt32Shape(sliceSizes)
+	id := C.mlx_tape_add_dynamic_slice(t.handle, C.int32_t(operand), C.int32_t(startIndices), slicePtr, rank, &cErr)
+	runtime.KeepAlive(cSlices)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddDynamicUpdateSlice records a DynamicUpdateSlice operation in the tape.
+func (t *Tape) AddDynamicUpdateSlice(operand, update, startIndices NodeID, rank int) (NodeID, error) {
+	var cErr C.MLXError
+	id := C.mlx_tape_add_dynamic_update_slice(t.handle, C.int32_t(operand), C.int32_t(update), C.int32_t(startIndices), C.int(rank), &cErr)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddConvGeneral records a ConvGeneral operation in the tape.
+func (t *Tape) AddConvGeneral(input, weight NodeID, strides, padLo, padHi, kernelDilations, inputDilations []int, groups int) (NodeID, error) {
+	var cErr C.MLXError
+	sPtr, numSpatial, cStrides := toInt32Shape(strides)
+	loPtr, _, cLo := toInt32Shape(padLo)
+	hiPtr, _, cHi := toInt32Shape(padHi)
+	kdPtr, _, cKD := toInt32Shape(kernelDilations)
+	idPtr, _, cID := toInt32Shape(inputDilations)
+	id := C.mlx_tape_add_conv_general(t.handle, C.int32_t(input), C.int32_t(weight),
+		sPtr, loPtr, hiPtr, kdPtr, idPtr, numSpatial, C.int(groups), &cErr)
+	runtime.KeepAlive(cStrides)
+	runtime.KeepAlive(cLo)
+	runtime.KeepAlive(cHi)
+	runtime.KeepAlive(cKD)
+	runtime.KeepAlive(cID)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddAsStrided records an as_strided view operation in the tape.
+func (t *Tape) AddAsStrided(input NodeID, shape []int, strides []int64, offset int64) (NodeID, error) {
+	var cErr C.MLXError
+	shapePtr, rank, cShape := toInt32Shape(shape)
+	var stridesPtr *C.int64_t
+	cStrides := make([]C.int64_t, len(strides))
+	for i, s := range strides {
+		cStrides[i] = C.int64_t(s)
+	}
+	if len(cStrides) > 0 {
+		stridesPtr = &cStrides[0]
+	}
+	id := C.mlx_tape_add_as_strided(t.handle, C.int32_t(input), shapePtr, stridesPtr, rank, C.int64_t(offset), &cErr)
+	runtime.KeepAlive(cShape)
+	runtime.KeepAlive(cStrides)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddSelectAndScatter records a SelectAndScatterMax or SelectAndScatterMin operation in the tape.
+func (t *Tape) AddSelectAndScatter(operand, source NodeID, isMax bool, windowDims, windowStrides, padLo, padHi []int) (NodeID, error) {
+	var cErr C.MLXError
+	wPtr, rank, cWin := toInt32Shape(windowDims)
+	sPtr, _, cStrides := toInt32Shape(windowStrides)
+	loPtr, _, cLo := toInt32Shape(padLo)
+	hiPtr, _, cHi := toInt32Shape(padHi)
+	id := C.mlx_tape_add_select_and_scatter(t.handle, C.int32_t(operand), C.int32_t(source),
+		C.bool(isMax), wPtr, sPtr, loPtr, hiPtr, rank, &cErr)
+	runtime.KeepAlive(cWin)
+	runtime.KeepAlive(cStrides)
+	runtime.KeepAlive(cLo)
+	runtime.KeepAlive(cHi)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddRNGBitGenerator records an RNGBitGenerator operation in the tape, returning (newStateID, valuesID).
+func (t *Tape) AddRNGBitGenerator(state NodeID, dtype DType, shape []int) (NodeID, NodeID, error) {
+	var cErr C.MLXError
+	shapePtr, rank, cShape := toInt32Shape(shape)
+	var newStateID, valuesID C.int32_t
+	ok := C.mlx_tape_add_rng_bit_generator(t.handle, C.int32_t(state), C.int(dtype),
+		shapePtr, rank, &newStateID, &valuesID, &cErr)
+	runtime.KeepAlive(cShape)
+	if !ok {
+		if err := extractError(cErr); err != nil {
+			return -1, -1, err
+		}
+		return -1, -1, fmt.Errorf("mlx: RNGBitGenerator failed")
+	}
+	return NodeID(newStateID), NodeID(valuesID), nil
+}
+
+// AddSort records a Sort operation in the tape.
+func (t *Tape) AddSort(input NodeID, axis int) (NodeID, error) {
+	var cErr C.MLXError
+	id := C.mlx_tape_add_sort(t.handle, C.int32_t(input), C.int(axis), &cErr)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddArgsort records an Argsort operation in the tape.
+func (t *Tape) AddArgsort(input NodeID, axis int) (NodeID, error) {
+	var cErr C.MLXError
+	id := C.mlx_tape_add_argsort(t.handle, C.int32_t(input), C.int(axis), &cErr)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddTakeAlongAxis records a take_along_axis operation in the tape.
+func (t *Tape) AddTakeAlongAxis(input, indices NodeID, axis int) (NodeID, error) {
+	var cErr C.MLXError
+	id := C.mlx_tape_add_take_along_axis(t.handle, C.int32_t(input), C.int32_t(indices), C.int(axis), &cErr)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddSoftmax records a Softmax operation in the tape.
+func (t *Tape) AddSoftmax(input NodeID, axis int) (NodeID, error) {
+	var cErr C.MLXError
+	id := C.mlx_tape_add_softmax(t.handle, C.int32_t(input), C.int(axis), &cErr)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddLayerNorm records a fast LayerNorm operation in the tape (pass -1 for gamma or beta if nil).
+func (t *Tape) AddLayerNorm(input, gamma, beta NodeID, eps float32) (NodeID, error) {
+	var cErr C.MLXError
+	id := C.mlx_tape_add_layer_norm(t.handle, C.int32_t(input), C.int32_t(gamma), C.int32_t(beta), C.float(eps), &cErr)
 	if err := extractError(cErr); err != nil {
 		return -1, err
 	}

@@ -114,6 +114,14 @@ const (
 	CumulativeMax CumulativeOp = 1
 )
 
+type ScatterOp = int
+
+const (
+	ScatterSum ScatterOp = 0
+	ScatterMax ScatterOp = 1
+	ScatterMin ScatterOp = 2
+)
+
 type ArrayHandle uintptr
 type NodeID = int32
 
@@ -175,6 +183,45 @@ func (t *Tape) AddCumulative(op CumulativeOp, input NodeID, axis int, reverse, e
 	return -1, errNoCGo
 }
 func (t *Tape) AddMatmul(lhs, rhs NodeID) (NodeID, error) { return -1, errNoCGo }
+func (t *Tape) AddSubParameter(dtype DType, shape []int) (NodeID, error) {
+	return -1, errNoCGo
+}
+func (t *Tape) Inline(paramIDs, argIDs, outputIDs []NodeID) ([]NodeID, error) {
+	return nil, errNoCGo
+}
+func (t *Tape) AddGather(operand, startIndices NodeID, indexVectorAxis int, startIndexMap, sliceSizes []int) (NodeID, error) {
+	return -1, errNoCGo
+}
+func (t *Tape) AddScatter(op ScatterOp, operand, indices, updates NodeID, indexVectorAxis int, axes []int) (NodeID, error) {
+	return -1, errNoCGo
+}
+func (t *Tape) AddDynamicSlice(operand, startIndices NodeID, sliceSizes []int) (NodeID, error) {
+	return -1, errNoCGo
+}
+func (t *Tape) AddDynamicUpdateSlice(operand, update, startIndices NodeID, rank int) (NodeID, error) {
+	return -1, errNoCGo
+}
+func (t *Tape) AddConvGeneral(input, weight NodeID, strides, padLo, padHi, kernelDilations, inputDilations []int, groups int) (NodeID, error) {
+	return -1, errNoCGo
+}
+func (t *Tape) AddAsStrided(input NodeID, shape []int, strides []int64, offset int64) (NodeID, error) {
+	return -1, errNoCGo
+}
+func (t *Tape) AddSelectAndScatter(operand, source NodeID, isMax bool, windowDims, windowStrides, padLo, padHi []int) (NodeID, error) {
+	return -1, errNoCGo
+}
+func (t *Tape) AddRNGBitGenerator(state NodeID, dtype DType, shape []int) (NodeID, NodeID, error) {
+	return -1, -1, errNoCGo
+}
+func (t *Tape) AddSort(input NodeID, axis int) (NodeID, error)    { return -1, errNoCGo }
+func (t *Tape) AddArgsort(input NodeID, axis int) (NodeID, error) { return -1, errNoCGo }
+func (t *Tape) AddTakeAlongAxis(input, indices NodeID, axis int) (NodeID, error) {
+	return -1, errNoCGo
+}
+func (t *Tape) AddSoftmax(input NodeID, axis int) (NodeID, error) { return -1, errNoCGo }
+func (t *Tape) AddLayerNorm(input, gamma, beta NodeID, eps float32) (NodeID, error) {
+	return -1, errNoCGo
+}
 func (t *Tape) Compile(outputIDs []NodeID, compileGraph, eagerContiguous bool) (*Exec, error) {
 	return nil, errNoCGo
 }
