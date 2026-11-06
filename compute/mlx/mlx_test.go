@@ -151,6 +151,84 @@ func TestSimpleParameterAndConstantExecution(t *testing.T) {
 	}
 }
 
+func TestDonatedBufferExecution(t *testing.T) {
+	backend, err := mlx.New("")
+	if err != nil {
+		t.Fatalf("mlx.New failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	shape := shapes.Make(dtypes.Float32, 4)
+	builder := backend.Builder("test_donate")
+	mainFn := builder.Main()
+	x, _ := mainFn.Parameter("x", shape, nil)
+	one, _ := mainFn.Constant([]float32{1, 2, 3, 4}, 4)
+	y, _ := mainFn.Add(x, one)
+	_ = mainFn.Return([]compute.Value{y}, nil)
+	exec, err := builder.Compile()
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+	defer exec.Finalize()
+
+	curBuf, err := backend.BufferFromFlatData(0, []float32{10, 20, 30, 40}, shape)
+	if err != nil {
+		t.Fatalf("BufferFromFlatData failed: %v", err)
+	}
+	for step := range 3 {
+		prevBuf := curBuf
+		outs, err := exec.Execute([]compute.Buffer{curBuf}, []bool{true}, 0)
+		if err != nil {
+			t.Fatalf("step %d Execute failed: %v", step, err)
+		}
+		// Donated buffer should be finalized and attempting ToFlatData on it should fail.
+		tmp := make([]float32, 4)
+		if err := prevBuf.ToFlatData(tmp); err == nil {
+			t.Fatalf("step %d: expected ToFlatData on donated buffer to fail", step)
+		}
+		curBuf = outs[0]
+	}
+	defer curBuf.Finalize()
+
+	got := make([]float32, 4)
+	if err := curBuf.ToFlatData(got); err != nil {
+		t.Fatalf("final ToFlatData failed: %v", err)
+	}
+	want := []float32{13, 26, 39, 52}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got[%d] = %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestSortCustomComparatorNotImplemented(t *testing.T) {
+	backend, err := mlx.New("")
+	if err != nil {
+		t.Fatalf("mlx.New failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("test_custom_sort")
+	mainFn := builder.Main()
+	x, _ := mainFn.Parameter("x", shapes.Make(dtypes.Float32, 4), nil)
+	comp, err := mainFn.Closure()
+	if err != nil {
+		t.Fatalf("Closure failed: %v", err)
+	}
+	lhs, _ := comp.Parameter("lhs", shapes.Make(dtypes.Float32), nil)
+	rhs, _ := comp.Parameter("rhs", shapes.Make(dtypes.Float32), nil)
+	absL, _ := comp.Abs(lhs)
+	absR, _ := comp.Abs(rhs)
+	lt, _ := comp.LessThan(absL, absR)
+	_ = comp.Return([]compute.Value{lt}, nil)
+
+	_, err = mainFn.Sort(comp, 0, false, x)
+	if !compute.IsNotImplemented(err) {
+		t.Fatalf("expected compute.ErrNotImplemented for custom Sort comparator, got: %v", err)
+	}
+}
+
 func TestCompliance(t *testing.T) {
 	for _, cfg := range []string{"", "dynamic", "dynamic,lazy_contiguous"} {
 		name := cfg

@@ -154,8 +154,13 @@ func (f *Function) DotGeneral(
 		return nil, errors.Wrap(err, "DotGeneral: matmul")
 	}
 
-	// Reshape from [B, M, N] to outShape.Dimensions.
-	resID, err = f.builder.tape.AddReshape(resID, outShape.Dimensions)
+	// Reshape from [B, M, N] to outShape.Dimensions, encoding any dynamic dimensions
+	// by referencing the corresponding lhs or rhs input node and axis.
+	outReshapeDims := encodeDotGeneralOutputDims(
+		outShape.Dimensions,
+		lhsNode, lhsBatch, lhsContracting,
+		rhsNode, rhsBatch, rhsContracting)
+	resID, err = f.builder.tape.AddReshape(resID, outReshapeDims)
 	if err != nil {
 		return nil, errors.Wrap(err, "DotGeneral: output reshape")
 	}
@@ -286,13 +291,13 @@ func isSimpleMatMul(
 	if len(lhsBatchAxes) != 0 || len(rhsBatchAxes) != 0 {
 		return false
 	}
-	if lhsShape.Rank() != 2 || rhsShape.Rank() != 2 {
+	if lhsShape.Rank() < 2 || rhsShape.Rank() != 2 {
 		return false
 	}
 	if len(lhsContractingAxes) != 1 || len(rhsContractingAxes) != 1 {
 		return false
 	}
-	return lhsContractingAxes[0] == 1 && rhsContractingAxes[0] == 0
+	return lhsContractingAxes[0] == lhsShape.Rank()-1 && rhsContractingAxes[0] == 0
 }
 
 func classifyAxes(shape shapes.Shape, batchAxes, contractingAxes []int) (batchSize, crossSize, contractingSize int, perm []int) {
@@ -343,4 +348,51 @@ func isIdentityPerm(perm []int) bool {
 		}
 	}
 	return true
+}
+
+func encodeDotGeneralOutputDims(
+	outDims []int,
+	lhsNode *graphNode, lhsBatchAxes, lhsContractingAxes []int,
+	rhsNode *graphNode, rhsBatchAxes, rhsContractingAxes []int,
+) []int {
+	if !slices.Contains(outDims, shapes.DynamicDim) {
+		return outDims
+	}
+	lhsSet := make(map[int]bool, len(lhsBatchAxes)+len(lhsContractingAxes))
+	for _, a := range lhsBatchAxes {
+		lhsSet[a] = true
+	}
+	for _, a := range lhsContractingAxes {
+		lhsSet[a] = true
+	}
+	rhsSet := make(map[int]bool, len(rhsBatchAxes)+len(rhsContractingAxes))
+	for _, a := range rhsBatchAxes {
+		rhsSet[a] = true
+	}
+	for _, a := range rhsContractingAxes {
+		rhsSet[a] = true
+	}
+
+	res := make([]int, 0, len(outDims))
+	enc := func(node *graphNode, axis int) int {
+		d := node.shape.Dimensions[axis]
+		if d != shapes.DynamicDim {
+			return d
+		}
+		return -(2 + int(node.id)*16 + axis)
+	}
+	for _, a := range lhsBatchAxes {
+		res = append(res, enc(lhsNode, a))
+	}
+	for i := range lhsNode.shape.Rank() {
+		if !lhsSet[i] {
+			res = append(res, enc(lhsNode, i))
+		}
+	}
+	for i := range rhsNode.shape.Rank() {
+		if !rhsSet[i] {
+			res = append(res, enc(rhsNode, i))
+		}
+	}
+	return res
 }

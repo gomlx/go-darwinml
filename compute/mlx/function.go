@@ -24,6 +24,15 @@ type graphNode struct {
 	shape shapes.Shape
 	name  string
 	owner *Function
+
+	// Optional op metadata used to pattern-match simple comparator closures in Sort:
+	hasUnaryOp bool
+	unaryOp    mlxbridge.UnaryOp
+	unaryIn    *graphNode
+
+	hasBinOp bool
+	binaryOp mlxbridge.BinaryOp
+	lhs, rhs *graphNode
 }
 
 // Function implements compute.Function for the MLX backend.
@@ -86,7 +95,13 @@ func (f *Function) Parameter(name string, shape shapes.Shape, _ *compute.Shardin
 		return nil, errors.Wrapf(compute.ErrNotImplemented,
 			"Parameter(%q): dynamic shape %s requires %q backend configuration", name, shape, "mlx:dynamic")
 	}
-	id, err := f.builder.tape.AddParameter(dtypeToBridgeDType(shape.DType), shape.Dimensions)
+	var id mlxbridge.NodeID
+	var err error
+	if f == f.builder.mainFn {
+		id, err = f.builder.tape.AddParameter(dtypeToBridgeDType(shape.DType), shape.Dimensions)
+	} else {
+		id, err = f.builder.tape.AddSubParameter(dtypeToBridgeDType(shape.DType), shape.Dimensions)
+	}
 	if err != nil {
 		return nil, errors.Wrapf(err, "Parameter(%q)", name)
 	}
@@ -142,6 +157,286 @@ func (f *Function) Return(outputs []compute.Value, _ []*compute.ShardingSpec) er
 	return nil
 }
 
+// Call invokes a target sub-function by inlining its recorded operations into the caller's tape.
+func (f *Function) Call(target compute.Function, inputs ...compute.Value) ([]compute.Value, error) {
+	targetFn, ok := target.(*Function)
+	if !ok || targetFn == nil {
+		return nil, errors.Errorf("Call: expected *mlx.Function, got %T", target)
+	}
+	if targetFn.builder != f.builder {
+		return nil, errors.New("Call: target function belongs to a different Builder")
+	}
+	if targetFn.parent != nil {
+		return nil, errors.New("Call: cannot call a closure; use Builder.NewFunction for callable functions")
+	}
+	if targetFn == f.builder.mainFn {
+		return nil, errors.New("Call: cannot call Main function")
+	}
+	if !targetFn.returned {
+		return nil, errors.Errorf("Call: target function %q has not called Return()", targetFn.name)
+	}
+	if len(inputs) != len(targetFn.params) {
+		return nil, errors.Errorf("Call(%q): expected %d inputs, got %d",
+			targetFn.name, len(targetFn.params), len(inputs))
+	}
+
+	argNodes, err := f.resolveNodes("Call", inputs...)
+	if err != nil {
+		return nil, err
+	}
+
+	paramIDs := make([]mlxbridge.NodeID, len(targetFn.params))
+	argIDs := make([]mlxbridge.NodeID, len(argNodes))
+	for i, p := range targetFn.params {
+		if !argNodes[i].shape.Equal(p.shape) {
+			return nil, errors.Errorf("Call(%q): input #%d shape %s does not match parameter %q shape %s",
+				targetFn.name, i, argNodes[i].shape, p.name, p.shape)
+		}
+		paramIDs[i] = p.id
+		argIDs[i] = argNodes[i].id
+	}
+
+	outIDs := make([]mlxbridge.NodeID, len(targetFn.outputs))
+	for i, out := range targetFn.outputs {
+		outIDs[i] = out.id
+	}
+
+	clonedIDs, err := f.builder.tape.Inline(paramIDs, argIDs, outIDs)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Call(%q)", targetFn.name)
+	}
+
+	results := make([]compute.Value, len(clonedIDs))
+	for i, id := range clonedIDs {
+		results[i] = &graphNode{
+			id:    id,
+			shape: targetFn.outputs[i].shape.Clone(),
+			owner: f,
+		}
+	}
+	return results, nil
+}
+
+// matchSortComparator inspects a Sort comparator closure and returns (ascending, ok).
+// It recognizes standard ascending (<, <=) and descending (>, >=) comparisons on the first input pair
+// (params[0] vs params[1]), including optional Identity or LogicalNot wrappers.
+func matchSortComparator(compFn *Function) (ascending bool, ok bool) {
+	if len(compFn.params) < 2 || len(compFn.outputs) != 1 {
+		return false, false
+	}
+	p0, p1 := compFn.params[0], compFn.params[1]
+	cur := compFn.outputs[0]
+	invert := false
+	for cur != nil && cur.hasUnaryOp {
+		switch cur.unaryOp {
+		case mlxbridge.UnaryIdentity:
+			cur = cur.unaryIn
+		case mlxbridge.UnaryLogicalNot:
+			invert = !invert
+			cur = cur.unaryIn
+		default:
+			return false, false
+		}
+	}
+	if cur == nil || !cur.hasBinOp {
+		return false, false
+	}
+	var asc bool
+	if cur.lhs == p0 && cur.rhs == p1 {
+		switch cur.binaryOp {
+		case mlxbridge.BinaryLessThan, mlxbridge.BinaryLessOrEqual:
+			asc = true
+		case mlxbridge.BinaryGreaterThan, mlxbridge.BinaryGreaterOrEqual:
+			asc = false
+		default:
+			return false, false
+		}
+	} else if cur.lhs == p1 && cur.rhs == p0 {
+		switch cur.binaryOp {
+		case mlxbridge.BinaryGreaterThan, mlxbridge.BinaryGreaterOrEqual:
+			asc = true
+		case mlxbridge.BinaryLessThan, mlxbridge.BinaryLessOrEqual:
+			asc = false
+		default:
+			return false, false
+		}
+	} else {
+		return false, false
+	}
+	if invert {
+		asc = !asc
+	}
+	return asc, true
+}
+
+// Sort sorts one or more tensors along axis using comparator.
+// Because MLX does not support arbitrary user-defined Metal comparator kernels, the MLX backend
+// pattern-matches standard ascending/descending comparators on the primary key tensor and lowers
+// them to native GPU mlx::core::sort or mlx::core::argsort + mlx::core::take_along_axis.
+func (f *Function) Sort(comparator compute.Function, axis int, _ bool, inputs ...compute.Value) ([]compute.Value, error) {
+	if len(inputs) == 0 {
+		return nil, errors.New("Sort: at least one input tensor is required")
+	}
+	compFn, ok := comparator.(*Function)
+	if !ok || compFn == nil {
+		return nil, errors.Errorf("Sort: expected *mlx.Function comparator, got %T", comparator)
+	}
+	if compFn.parent == nil {
+		return nil, errors.New("Sort: comparator must be a closure created with Closure()")
+	}
+	if !compFn.returned {
+		return nil, errors.New("Sort: comparator closure has not called Return()")
+	}
+
+	inNodes, err := f.resolveNodes("Sort", inputs...)
+	if err != nil {
+		return nil, err
+	}
+
+	rank := inNodes[0].shape.Rank()
+	if axis < 0 {
+		axis += rank
+	}
+	if axis < 0 || axis >= rank {
+		return nil, errors.Errorf("Sort: axis %d out of bounds for shape %s", axis, inNodes[0].shape)
+	}
+	for i, n := range inNodes {
+		if n.shape.IsDynamic() {
+			return nil, errors.Wrapf(compute.ErrNotImplemented,
+				"Sort: dynamic shape %s is not supported in %q backend", n.shape, BackendName)
+		}
+		if !n.shape.EqualDimensions(inNodes[0].shape) {
+			return nil, errors.Errorf("Sort: input #%d shape %s does not match input #0 dimensions %s",
+				i, n.shape, inNodes[0].shape)
+		}
+	}
+	if len(compFn.params) != 2*len(inNodes) {
+		return nil, errors.Errorf("Sort: comparator has %d parameters, expected %d (2 per input tensor)",
+			len(compFn.params), 2*len(inNodes))
+	}
+	for i, n := range inNodes {
+		pLHS := compFn.params[2*i]
+		pRHS := compFn.params[2*i+1]
+		if !pLHS.shape.IsScalar() || pLHS.shape.DType != n.shape.DType ||
+			!pRHS.shape.IsScalar() || pRHS.shape.DType != n.shape.DType {
+			return nil, errors.Errorf("Sort: comparator parameters %d,%d must be scalars of dtype %s, got %s and %s",
+				2*i, 2*i+1, n.shape.DType, pLHS.shape, pRHS.shape)
+		}
+	}
+	if len(compFn.outputs) != 1 || !compFn.outputs[0].shape.IsScalar() || compFn.outputs[0].shape.DType != dtypes.Bool {
+		return nil, errors.New("Sort: comparator must return a single scalar Bool value")
+	}
+
+	keyDType := inNodes[0].shape.DType
+	if keyDType.IsComplex() {
+		return nil, errors.Wrapf(compute.ErrNotImplemented,
+			"Sort: Complex64 key tensor is not supported in %q backend", BackendName)
+	}
+
+	ascending, matched := matchSortComparator(compFn)
+	if !matched {
+		return nil, errors.Wrapf(compute.ErrNotImplemented,
+			"Sort: %q backend only supports standard ascending (<, <=) or descending (>, >=) comparators on the primary key tensor; please refactor custom comparator logic",
+			BackendName)
+	}
+
+	if inNodes[0].shape.Dimensions[axis] <= 1 {
+		outs := make([]compute.Value, len(inNodes))
+		for i, n := range inNodes {
+			outs[i], err = f.Identity(n)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return outs, nil
+	}
+
+	// Single-tensor ascending sort: use mlx::core::sort directly.
+	if ascending && len(inNodes) == 1 {
+		keyID := inNodes[0].id
+		if keyDType == dtypes.Bool {
+			keyID, err = f.builder.tape.AddConvertDType(keyID, mlxbridge.DTypeUint8)
+			if err != nil {
+				return nil, errors.Wrap(err, "Sort")
+			}
+		}
+		sortedID, err := f.builder.tape.AddSort(keyID, axis)
+		if err != nil {
+			return nil, errors.Wrap(err, "Sort")
+		}
+		if keyDType == dtypes.Bool {
+			sortedID, err = f.builder.tape.AddConvertDType(sortedID, mlxbridge.DTypeBool)
+			if err != nil {
+				return nil, errors.Wrap(err, "Sort")
+			}
+		}
+		return []compute.Value{&graphNode{id: sortedID, shape: inNodes[0].shape.Clone(), owner: f}}, nil
+	}
+
+	// General path (descending or multi-tensor sort): compute stable argsort indices on key
+	// (applying an order-reversing bijection for descending sort so tie stability is preserved).
+	keyID := inNodes[0].id
+	if !ascending {
+		switch {
+		case keyDType.IsFloat():
+			keyID, err = f.builder.tape.AddUnary(mlxbridge.UnaryNeg, keyID)
+		case keyDType.IsInt():
+			keyID, err = f.builder.tape.AddUnary(mlxbridge.UnaryBitwiseNot, keyID)
+		case keyDType == dtypes.Bool:
+			keyID, err = f.builder.tape.AddUnary(mlxbridge.UnaryLogicalNot, keyID)
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "Sort: key transform")
+		}
+	}
+	if keyDType == dtypes.Bool {
+		keyID, err = f.builder.tape.AddConvertDType(keyID, mlxbridge.DTypeUint8)
+		if err != nil {
+			return nil, errors.Wrap(err, "Sort: bool cast")
+		}
+	}
+
+	indicesID, err := f.builder.tape.AddArgsort(keyID, axis)
+	if err != nil {
+		return nil, errors.Wrap(err, "Sort: argsort")
+	}
+
+	outs := make([]compute.Value, len(inNodes))
+	for i, n := range inNodes {
+		inID := n.id
+		if n.shape.DType == dtypes.Complex64 {
+			reVal, err := f.Real(n)
+			if err != nil {
+				return nil, err
+			}
+			imVal, err := f.Imag(n)
+			if err != nil {
+				return nil, err
+			}
+			reSortedID, err := f.builder.tape.AddTakeAlongAxis(reVal.(*graphNode).id, indicesID, axis)
+			if err != nil {
+				return nil, err
+			}
+			imSortedID, err := f.builder.tape.AddTakeAlongAxis(imVal.(*graphNode).id, indicesID, axis)
+			if err != nil {
+				return nil, err
+			}
+			cID, err := f.builder.tape.AddBinary(mlxbridge.BinaryComplex, reSortedID, imSortedID)
+			if err != nil {
+				return nil, err
+			}
+			outs[i] = &graphNode{id: cID, shape: n.shape.Clone(), owner: f}
+			continue
+		}
+		sortedID, err := f.builder.tape.AddTakeAlongAxis(inID, indicesID, axis)
+		if err != nil {
+			return nil, errors.Wrapf(err, "Sort: take_along_axis input #%d", i)
+		}
+		outs[i] = &graphNode{id: sortedID, shape: n.shape.Clone(), owner: f}
+	}
+	return outs, nil
+}
+
 // resolveNode validates that v is a *graphNode belonging to this function or an ancestor.
 func (f *Function) resolveNode(v compute.Value) (*graphNode, error) {
 	node, ok := v.(*graphNode)
@@ -195,7 +490,14 @@ func (f *Function) Identity(x compute.Value) (compute.Value, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "Identity")
 	}
-	return &graphNode{id: id, shape: node.shape.Clone(), owner: f}, nil
+	return &graphNode{
+		id:         id,
+		shape:      node.shape.Clone(),
+		owner:      f,
+		hasUnaryOp: true,
+		unaryOp:    mlxbridge.UnaryIdentity,
+		unaryIn:    node,
+	}, nil
 }
 
 // OptimizationBarrier returns values identical to the operands.
@@ -310,7 +612,14 @@ func (f *Function) unaryOp(opName string, opType compute.OpType, mlxOp mlxbridge
 	if err != nil {
 		return nil, errors.Wrap(err, opName)
 	}
-	return &graphNode{id: id, shape: outShape.Clone(), owner: f}, nil
+	return &graphNode{
+		id:         id,
+		shape:      outShape.Clone(),
+		owner:      f,
+		hasUnaryOp: true,
+		unaryOp:    mlxOp,
+		unaryIn:    node,
+	}, nil
 }
 
 func (f *Function) Abs(x compute.Value) (compute.Value, error) {
@@ -598,7 +907,15 @@ func (f *Function) comparisonOp(opName string, opType compute.OpType, mlxOp mlxb
 	if err != nil {
 		return nil, errors.Wrap(err, opName)
 	}
-	return &graphNode{id: id, shape: outShape, owner: f}, nil
+	return &graphNode{
+		id:       id,
+		shape:    outShape,
+		owner:    f,
+		hasBinOp: true,
+		binaryOp: mlxOp,
+		lhs:      nodes[0],
+		rhs:      nodes[1],
+	}, nil
 }
 
 func (f *Function) Equal(lhs, rhs compute.Value) (compute.Value, error) {

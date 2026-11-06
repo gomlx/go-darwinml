@@ -11,9 +11,9 @@ import (
 
 // baseCapabilities declares which ops and dtypes the MLX backend supports in default static compiled mode.
 var baseCapabilities = compute.Capabilities{
-	Functions:      false,
-	DynamicAxes:    false,
-	DynamicShapes:  compute.DynamicShapesNone,
+	Functions:       true,
+	DynamicAxes:     false,
+	DynamicShapes:   compute.DynamicShapesNone,
 	DynamicDimDType: dtypes.Int32,
 
 	Operations: map[compute.OpType]bool{
@@ -120,6 +120,36 @@ var baseCapabilities = compute.Capabilities{
 		compute.OpTypeCumSum:           true,
 		compute.OpTypeCumMax:           true,
 		compute.OpTypeDotGeneral:       true,
+
+		// Indexing, Gather, Scatter, DynamicSlice
+		compute.OpTypeGather:             true,
+		compute.OpTypeScatterSum:         true,
+		compute.OpTypeScatterMax:         true,
+		compute.OpTypeScatterMin:         true,
+		compute.OpTypeDynamicSlice:       true,
+		compute.OpTypeDynamicUpdateSlice: true,
+
+		// Convolutions, Pooling, BatchNorm, RNG
+		compute.OpTypeConvGeneral:          true,
+		compute.OpTypeReduceWindow:         true,
+		compute.OpTypeSelectAndScatterMax:  true,
+		compute.OpTypeSelectAndScatterMin:  true,
+		compute.OpTypeBatchNormForInference: true,
+		compute.OpTypeBatchNormForTraining:  true,
+		compute.OpTypeBatchNormGradient:     true,
+		compute.OpTypeRNGBitGenerator:      true,
+
+		// Sub-functions & Sort
+		compute.OpTypeCall: true,
+		compute.OpTypeSort: true,
+
+		// Fused operations
+		compute.OpTypeFusedSoftmax:                   true,
+		compute.OpTypeFusedLayerNorm:                 true,
+		compute.OpTypeFusedActivation:                true,
+		compute.OpTypeFusedDense:                     true,
+		compute.OpTypeFusedAttentionQKVProjection:    true,
+		compute.OpTypeFusedScaledDotProductAttention: true,
 	},
 
 	DTypes: map[dtypes.DType]bool{
