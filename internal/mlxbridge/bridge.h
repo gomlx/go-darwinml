@@ -102,6 +102,26 @@ typedef enum {
     MLX_BINARY_GREATER_OR_EQUAL       = 24,
 } MLXBinaryOp;
 
+// Reduction operation types recorded in an MLXTape.
+typedef enum {
+    MLX_REDUCE_SUM         = 0,
+    MLX_REDUCE_PRODUCT     = 1,
+    MLX_REDUCE_MAX         = 2,
+    MLX_REDUCE_MIN         = 3,
+    MLX_REDUCE_LOGICAL_AND = 4,
+    MLX_REDUCE_LOGICAL_OR  = 5,
+    MLX_REDUCE_LOGICAL_XOR = 6,
+    MLX_REDUCE_BITWISE_AND = 7,
+    MLX_REDUCE_BITWISE_OR  = 8,
+    MLX_REDUCE_BITWISE_XOR = 9,
+} MLXReduceOp;
+
+// Cumulative operation types recorded in an MLXTape.
+typedef enum {
+    MLX_CUMULATIVE_SUM = 0,
+    MLX_CUMULATIVE_MAX = 1,
+} MLXCumulativeOp;
+
 // --- Initialization & Device Info ---
 
 // Initializes the MLX bridge, dynamically verifying that libmlx.dylib is installed
@@ -177,6 +197,56 @@ int32_t mlx_tape_add_bitcast(MLXTapeHandle tape, int32_t input, int target_dtype
 // Records an Iota operation generating [0, 1, ..., dim-1] along iota_axis broadcast to shape.
 int32_t mlx_tape_add_iota(MLXTapeHandle tape, int dtype,
     const int32_t* shape, int rank, int iota_axis, MLXError* error);
+
+// Records a Reshape operation on input node ID to shape.
+int32_t mlx_tape_add_reshape(MLXTapeHandle tape, int32_t input,
+    const int32_t* shape, int rank, MLXError* error);
+
+// Records a Transpose operation on input node ID with the given axes permutation.
+int32_t mlx_tape_add_transpose(MLXTapeHandle tape, int32_t input,
+    const int32_t* axes, int rank, MLXError* error);
+
+// Records a BroadcastInDim operation on input node ID to out_shape with sorted broadcast_axes.
+int32_t mlx_tape_add_broadcast_in_dim(MLXTapeHandle tape, int32_t input,
+    const int32_t* out_shape, int out_rank,
+    const int32_t* broadcast_axes, int num_broadcast_axes, MLXError* error);
+
+// Records a static Slice operation (with support for limits[i] < 0 meaning full dynamic axis).
+int32_t mlx_tape_add_slice(MLXTapeHandle tape, int32_t input,
+    const int32_t* starts, const int32_t* limits, const int32_t* strides, int rank, MLXError* error);
+
+// Records a Concatenate operation along axis.
+int32_t mlx_tape_add_concatenate(MLXTapeHandle tape,
+    const int32_t* inputs, int num_inputs, int axis, MLXError* error);
+
+// Records a Reverse (flip) operation along axes.
+int32_t mlx_tape_add_reverse(MLXTapeHandle tape, int32_t input,
+    const int32_t* axes, int num_axes, MLXError* error);
+
+// Records an edge Pad operation with constant scalar fill_value.
+int32_t mlx_tape_add_pad(MLXTapeHandle tape, int32_t input, int32_t fill_value,
+    const int32_t* axes, const int32_t* low_pad, const int32_t* high_pad, int num_axes, MLXError* error);
+
+// Records a Where (ternary selection) operation.
+int32_t mlx_tape_add_where(MLXTapeHandle tape, int32_t cond, int32_t on_true, int32_t on_false, MLXError* error);
+
+// Records a Clamp (clip) operation.
+int32_t mlx_tape_add_clamp(MLXTapeHandle tape, int32_t min_val, int32_t input, int32_t max_val, MLXError* error);
+
+// Records a reduction operation (MLXReduceOp) over axes.
+int32_t mlx_tape_add_reduce(MLXTapeHandle tape, int op, int32_t input,
+    const int32_t* axes, int num_axes, MLXError* error);
+
+// Records an ArgMin or ArgMax operation along axis, casting result to output_dtype.
+int32_t mlx_tape_add_arg_min_max(MLXTapeHandle tape, int32_t input,
+    int axis, bool is_min, int output_dtype, MLXError* error);
+
+// Records a cumulative operation (CumSum or CumMax) along axis.
+int32_t mlx_tape_add_cumulative(MLXTapeHandle tape, int op, int32_t input,
+    int axis, bool reverse, bool exclusive, MLXError* error);
+
+// Records a matrix multiplication (matmul) on lhs and rhs node IDs.
+int32_t mlx_tape_add_matmul(MLXTapeHandle tape, int32_t lhs, int32_t rhs, MLXError* error);
 
 // Compiles a tape into an executable.
 // If compile_graph is true, traces and compiles the tape with mlx::core::compile.

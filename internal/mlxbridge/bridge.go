@@ -104,6 +104,30 @@ const (
 	BinaryGreaterOrEqual       BinaryOp = C.MLX_BINARY_GREATER_OR_EQUAL
 )
 
+// ReduceOp mirrors the MLXReduceOp enum in bridge.h.
+type ReduceOp = int
+
+const (
+	ReduceSum        ReduceOp = C.MLX_REDUCE_SUM
+	ReduceProduct    ReduceOp = C.MLX_REDUCE_PRODUCT
+	ReduceMax        ReduceOp = C.MLX_REDUCE_MAX
+	ReduceMin        ReduceOp = C.MLX_REDUCE_MIN
+	ReduceLogicalAnd ReduceOp = C.MLX_REDUCE_LOGICAL_AND
+	ReduceLogicalOr  ReduceOp = C.MLX_REDUCE_LOGICAL_OR
+	ReduceLogicalXor ReduceOp = C.MLX_REDUCE_LOGICAL_XOR
+	ReduceBitwiseAnd ReduceOp = C.MLX_REDUCE_BITWISE_AND
+	ReduceBitwiseOr  ReduceOp = C.MLX_REDUCE_BITWISE_OR
+	ReduceBitwiseXor ReduceOp = C.MLX_REDUCE_BITWISE_XOR
+)
+
+// CumulativeOp mirrors the MLXCumulativeOp enum in bridge.h.
+type CumulativeOp = int
+
+const (
+	CumulativeSum CumulativeOp = C.MLX_CUMULATIVE_SUM
+	CumulativeMax CumulativeOp = C.MLX_CUMULATIVE_MAX
+)
+
 // ArrayHandle is an opaque uintptr handle to a C++ mlx::core::array*.
 type ArrayHandle uintptr
 
@@ -384,6 +408,169 @@ func (t *Tape) AddIota(dtype DType, shape []int, iotaAxis int) (NodeID, error) {
 	shapePtr, rank, cShape := toInt32Shape(shape)
 	id := C.mlx_tape_add_iota(t.handle, C.int(dtype), shapePtr, rank, C.int(iotaAxis), &cErr)
 	runtime.KeepAlive(cShape)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddReshape records a Reshape operation in the tape.
+func (t *Tape) AddReshape(input NodeID, outShape []int) (NodeID, error) {
+	var cErr C.MLXError
+	shapePtr, rank, cShape := toInt32Shape(outShape)
+	id := C.mlx_tape_add_reshape(t.handle, C.int32_t(input), shapePtr, rank, &cErr)
+	runtime.KeepAlive(cShape)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddTranspose records a Transpose operation in the tape.
+func (t *Tape) AddTranspose(input NodeID, axes []int) (NodeID, error) {
+	var cErr C.MLXError
+	axesPtr, rank, cAxes := toInt32Shape(axes)
+	id := C.mlx_tape_add_transpose(t.handle, C.int32_t(input), axesPtr, rank, &cErr)
+	runtime.KeepAlive(cAxes)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddBroadcastInDim records a BroadcastInDim operation in the tape.
+func (t *Tape) AddBroadcastInDim(input NodeID, outShape []int, broadcastAxes []int) (NodeID, error) {
+	var cErr C.MLXError
+	shapePtr, outRank, cShape := toInt32Shape(outShape)
+	axesPtr, axesLen, cAxes := toInt32Shape(broadcastAxes)
+	id := C.mlx_tape_add_broadcast_in_dim(t.handle, C.int32_t(input), shapePtr, outRank, axesPtr, axesLen, &cErr)
+	runtime.KeepAlive(cShape)
+	runtime.KeepAlive(cAxes)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddSlice records a Slice operation in the tape.
+func (t *Tape) AddSlice(input NodeID, starts, limits, strides []int) (NodeID, error) {
+	var cErr C.MLXError
+	startsPtr, rank, cStarts := toInt32Shape(starts)
+	limitsPtr, _, cLimits := toInt32Shape(limits)
+	stridesPtr, _, cStrides := toInt32Shape(strides)
+	id := C.mlx_tape_add_slice(t.handle, C.int32_t(input), startsPtr, limitsPtr, stridesPtr, rank, &cErr)
+	runtime.KeepAlive(cStarts)
+	runtime.KeepAlive(cLimits)
+	runtime.KeepAlive(cStrides)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddConcatenate records a Concatenate operation in the tape.
+func (t *Tape) AddConcatenate(inputs []NodeID, axis int) (NodeID, error) {
+	var cErr C.MLXError
+	var inPtr *C.int32_t
+	cIns := make([]C.int32_t, len(inputs))
+	for i, id := range inputs {
+		cIns[i] = C.int32_t(id)
+	}
+	if len(cIns) > 0 {
+		inPtr = &cIns[0]
+	}
+	id := C.mlx_tape_add_concatenate(t.handle, inPtr, C.int(len(cIns)), C.int(axis), &cErr)
+	runtime.KeepAlive(cIns)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddReverse records a Reverse operation in the tape.
+func (t *Tape) AddReverse(input NodeID, axes []int) (NodeID, error) {
+	var cErr C.MLXError
+	axesPtr, axesLen, cAxes := toInt32Shape(axes)
+	id := C.mlx_tape_add_reverse(t.handle, C.int32_t(input), axesPtr, axesLen, &cErr)
+	runtime.KeepAlive(cAxes)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddPad records an edge Pad operation in the tape.
+func (t *Tape) AddPad(input, padValue NodeID, axes, lowPads, highPads []int) (NodeID, error) {
+	var cErr C.MLXError
+	axesPtr, axesLen, cAxes := toInt32Shape(axes)
+	lowPtr, _, cLow := toInt32Shape(lowPads)
+	highPtr, _, cHigh := toInt32Shape(highPads)
+	id := C.mlx_tape_add_pad(t.handle, C.int32_t(input), C.int32_t(padValue), axesPtr, lowPtr, highPtr, axesLen, &cErr)
+	runtime.KeepAlive(cAxes)
+	runtime.KeepAlive(cLow)
+	runtime.KeepAlive(cHigh)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddWhere records a Where (select) operation in the tape.
+func (t *Tape) AddWhere(cond, onTrue, onFalse NodeID) (NodeID, error) {
+	var cErr C.MLXError
+	id := C.mlx_tape_add_where(t.handle, C.int32_t(cond), C.int32_t(onTrue), C.int32_t(onFalse), &cErr)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddClamp records a Clamp (clip) operation in the tape.
+func (t *Tape) AddClamp(minVal, input, maxVal NodeID) (NodeID, error) {
+	var cErr C.MLXError
+	id := C.mlx_tape_add_clamp(t.handle, C.int32_t(minVal), C.int32_t(input), C.int32_t(maxVal), &cErr)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddReduce records a reduction operation in the tape.
+func (t *Tape) AddReduce(op ReduceOp, input NodeID, axes []int) (NodeID, error) {
+	var cErr C.MLXError
+	axesPtr, axesLen, cAxes := toInt32Shape(axes)
+	id := C.mlx_tape_add_reduce(t.handle, C.int(op), C.int32_t(input), axesPtr, axesLen, &cErr)
+	runtime.KeepAlive(cAxes)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddArgMinMax records an ArgMin or ArgMax operation in the tape.
+func (t *Tape) AddArgMinMax(input NodeID, axis int, isMin bool, outputDType DType) (NodeID, error) {
+	var cErr C.MLXError
+	id := C.mlx_tape_add_arg_min_max(t.handle, C.int32_t(input), C.int(axis), C.bool(isMin), C.int(outputDType), &cErr)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddCumulative records a cumulative sum or max operation in the tape.
+func (t *Tape) AddCumulative(op CumulativeOp, input NodeID, axis int, reverse, exclusive bool) (NodeID, error) {
+	var cErr C.MLXError
+	id := C.mlx_tape_add_cumulative(t.handle, C.int(op), C.int32_t(input), C.int(axis), C.bool(reverse), C.bool(exclusive), &cErr)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddMatmul records a matrix multiplication in the tape.
+func (t *Tape) AddMatmul(lhs, rhs NodeID) (NodeID, error) {
+	var cErr C.MLXError
+	id := C.mlx_tape_add_matmul(t.handle, C.int32_t(lhs), C.int32_t(rhs), &cErr)
 	if err := extractError(cErr); err != nil {
 		return -1, err
 	}

@@ -92,6 +92,28 @@ const (
 	BinaryGreaterOrEqual       BinaryOp = 24
 )
 
+type ReduceOp = int
+
+const (
+	ReduceSum        ReduceOp = 0
+	ReduceProduct    ReduceOp = 1
+	ReduceMax        ReduceOp = 2
+	ReduceMin        ReduceOp = 3
+	ReduceLogicalAnd ReduceOp = 4
+	ReduceLogicalOr  ReduceOp = 5
+	ReduceLogicalXor ReduceOp = 6
+	ReduceBitwiseAnd ReduceOp = 7
+	ReduceBitwiseOr  ReduceOp = 8
+	ReduceBitwiseXor ReduceOp = 9
+)
+
+type CumulativeOp = int
+
+const (
+	CumulativeSum CumulativeOp = 0
+	CumulativeMax CumulativeOp = 1
+)
+
 type ArrayHandle uintptr
 type NodeID = int32
 
@@ -128,6 +150,31 @@ func (t *Tape) AddBitcast(input NodeID, targetDType DType, outShape []int) (Node
 	return -1, errNoCGo
 }
 func (t *Tape) AddIota(dtype DType, shape []int, iotaAxis int) (NodeID, error) { return -1, errNoCGo }
+func (t *Tape) AddReshape(input NodeID, outShape []int) (NodeID, error)        { return -1, errNoCGo }
+func (t *Tape) AddTranspose(input NodeID, axes []int) (NodeID, error)          { return -1, errNoCGo }
+func (t *Tape) AddBroadcastInDim(input NodeID, outShape []int, broadcastAxes []int) (NodeID, error) {
+	return -1, errNoCGo
+}
+func (t *Tape) AddSlice(input NodeID, starts, limits, strides []int) (NodeID, error) {
+	return -1, errNoCGo
+}
+func (t *Tape) AddConcatenate(inputs []NodeID, axis int) (NodeID, error) { return -1, errNoCGo }
+func (t *Tape) AddReverse(input NodeID, axes []int) (NodeID, error)       { return -1, errNoCGo }
+func (t *Tape) AddPad(input, padValue NodeID, axes, lowPads, highPads []int) (NodeID, error) {
+	return -1, errNoCGo
+}
+func (t *Tape) AddWhere(cond, onTrue, onFalse NodeID) (NodeID, error)  { return -1, errNoCGo }
+func (t *Tape) AddClamp(minVal, input, maxVal NodeID) (NodeID, error)  { return -1, errNoCGo }
+func (t *Tape) AddReduce(op ReduceOp, input NodeID, axes []int) (NodeID, error) {
+	return -1, errNoCGo
+}
+func (t *Tape) AddArgMinMax(input NodeID, axis int, isMin bool, outputDType DType) (NodeID, error) {
+	return -1, errNoCGo
+}
+func (t *Tape) AddCumulative(op CumulativeOp, input NodeID, axis int, reverse, exclusive bool) (NodeID, error) {
+	return -1, errNoCGo
+}
+func (t *Tape) AddMatmul(lhs, rhs NodeID) (NodeID, error) { return -1, errNoCGo }
 func (t *Tape) Compile(outputIDs []NodeID, compileGraph, eagerContiguous bool) (*Exec, error) {
 	return nil, errNoCGo
 }

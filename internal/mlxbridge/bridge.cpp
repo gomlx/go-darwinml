@@ -32,6 +32,7 @@ static const char* kInstallHelpMsg =
 #if __has_include(<mlx/mlx.h>)
 #define GOMLX_HAS_MLX_HEADERS 1
 #include <mlx/mlx.h>
+#include <algorithm>
 #include <memory>
 #include <vector>
 #else
@@ -143,15 +144,34 @@ enum class TapeOpKind {
     ConvertDType,
     Bitcast,
     Iota,
+    Reshape,
+    Transpose,
+    BroadcastInDim,
+    Slice,
+    Concatenate,
+    Reverse,
+    Pad,
+    Where,
+    Clamp,
+    Reduce,
+    ArgMinMax,
+    Cumulative,
+    Matmul,
 };
 
 struct TapeNode {
     TapeOpKind kind;
-    int index = 0; // index into params or constants, or op code / iota axis
+    int index = 0; // index into params or constants, or op code / axis
     int32_t lhs = -1;
     int32_t rhs = -1;
+    int32_t third = -1;
     mlx::core::Dtype dtype{mlx::core::float32};
     mlx::core::Shape shape;
+    std::vector<int> axes;
+    std::vector<int32_t> inputs;
+    mlx::core::Shape slice_start;
+    mlx::core::Shape slice_stop;
+    mlx::core::Shape slice_strides;
 };
 
 mlx::core::Dtype toUnsignedIntDType(mlx::core::Dtype dt, int* bits) {
@@ -433,6 +453,121 @@ mlx::core::array evalBinaryOp(int op, const mlx::core::array& lhs, const mlx::co
     return lhs;
 }
 
+mlx::core::array evalBitwiseReduce(int op, const mlx::core::array& a, const std::vector<int>& axes) {
+    if (axes.empty() || a.ndim() == 0) {
+        return a;
+    }
+    std::vector<int> sorted_axes = axes;
+    std::sort(sorted_axes.begin(), sorted_axes.end(), std::greater<int>());
+
+    auto applyOp = [op](const mlx::core::array& x, const mlx::core::array& y) {
+        switch (static_cast<MLXReduceOp>(op)) {
+            case MLX_REDUCE_BITWISE_AND: return mlx::core::bitwise_and(x, y);
+            case MLX_REDUCE_BITWISE_OR:  return mlx::core::bitwise_or(x, y);
+            case MLX_REDUCE_BITWISE_XOR: return mlx::core::bitwise_xor(x, y);
+            default:                     return mlx::core::bitwise_and(x, y);
+        }
+    };
+
+    mlx::core::array cur = a;
+    for (int ax : sorted_axes) {
+        int rank = static_cast<int>(cur.ndim());
+        int32_t n = cur.shape(ax);
+        while (n > 1) {
+            int32_t half = n / 2;
+            mlx::core::Shape start1(rank, 0), stop1 = cur.shape();
+            mlx::core::Shape start2(rank, 0), stop2 = cur.shape();
+            stop1[ax] = half;
+            start2[ax] = half;
+            stop2[ax] = 2 * half;
+            mlx::core::array left = mlx::core::slice(cur, start1, stop1);
+            mlx::core::array right = mlx::core::slice(cur, start2, stop2);
+            mlx::core::array combined = applyOp(left, right);
+            if (n % 2 == 1) {
+                mlx::core::Shape start3(rank, 0), stop3 = cur.shape();
+                start3[ax] = 2 * half;
+                mlx::core::array tail = mlx::core::slice(cur, start3, stop3);
+                cur = mlx::core::concatenate({combined, tail}, ax);
+            } else {
+                cur = std::move(combined);
+            }
+            n = cur.shape(ax);
+        }
+        cur = mlx::core::squeeze(cur, ax);
+    }
+    return cur;
+}
+
+mlx::core::array evalReduceOp(int op, const mlx::core::array& a, const std::vector<int>& axes) {
+    if (axes.empty() || a.ndim() == 0) {
+        return a;
+    }
+    switch (static_cast<MLXReduceOp>(op)) {
+        case MLX_REDUCE_SUM: {
+            mlx::core::array res = mlx::core::sum(a, axes, /*keepdims=*/false);
+            if (res.dtype() != a.dtype()) {
+                res = mlx::core::astype(res, a.dtype());
+            }
+            return res;
+        }
+        case MLX_REDUCE_PRODUCT: {
+            mlx::core::array res = mlx::core::prod(a, axes, /*keepdims=*/false);
+            if (res.dtype() != a.dtype()) {
+                res = mlx::core::astype(res, a.dtype());
+            }
+            return res;
+        }
+        case MLX_REDUCE_MAX:
+            return mlx::core::max(a, axes, /*keepdims=*/false);
+        case MLX_REDUCE_MIN:
+            return mlx::core::min(a, axes, /*keepdims=*/false);
+        case MLX_REDUCE_LOGICAL_AND:
+            return mlx::core::all(a, axes, /*keepdims=*/false);
+        case MLX_REDUCE_LOGICAL_OR:
+            return mlx::core::any(a, axes, /*keepdims=*/false);
+        case MLX_REDUCE_LOGICAL_XOR: {
+            mlx::core::array s = mlx::core::sum(
+                mlx::core::astype(a, mlx::core::uint32), axes, /*keepdims=*/false);
+            return mlx::core::not_equal(
+                mlx::core::bitwise_and(s, mlx::core::array(uint32_t(1))),
+                mlx::core::array(uint32_t(0)));
+        }
+        case MLX_REDUCE_BITWISE_AND:
+        case MLX_REDUCE_BITWISE_OR:
+        case MLX_REDUCE_BITWISE_XOR:
+            return evalBitwiseReduce(op, a, axes);
+    }
+    return a;
+}
+
+mlx::core::array evalMatmul(const mlx::core::array& lhs, const mlx::core::array& rhs) {
+    if (lhs.dtype() == mlx::core::complex64) {
+        mlx::core::array a = mlx::core::real(lhs);
+        mlx::core::array b = mlx::core::imag(lhs);
+        mlx::core::array c = mlx::core::real(rhs);
+        mlx::core::array d = mlx::core::imag(rhs);
+        mlx::core::array re = mlx::core::subtract(
+            mlx::core::matmul(a, c),
+            mlx::core::matmul(b, d));
+        mlx::core::array im = mlx::core::add(
+            mlx::core::matmul(a, d),
+            mlx::core::matmul(b, c));
+        return evalBinaryOp(MLX_BINARY_COMPLEX, re, im);
+    }
+    if (!isFloatDType(lhs.dtype())) {
+        // Integer matmul: lhs[..., M, K] @ rhs[..., K, N] via exact integer broadcast multiply + sum.
+        mlx::core::array l_exp = mlx::core::expand_dims(lhs, -1); // [..., M, K, 1]
+        mlx::core::array r_exp = mlx::core::expand_dims(rhs, -3); // [..., 1, K, N]
+        mlx::core::array prod = mlx::core::multiply(l_exp, r_exp);
+        mlx::core::array res = mlx::core::sum(prod, -2, /*keepdims=*/false);
+        if (res.dtype() != lhs.dtype()) {
+            res = mlx::core::astype(res, lhs.dtype());
+        }
+        return res;
+    }
+    return mlx::core::matmul(lhs, rhs);
+}
+
 struct MLXTape {
     int num_params = 0;
     std::vector<mlx::core::Dtype> param_dtypes;
@@ -495,6 +630,139 @@ struct MLXTape {
                     values.push_back(std::move(r));
                     break;
                 }
+                case TapeOpKind::Reshape:
+                    values.push_back(mlx::core::reshape(values.at(node.lhs), node.shape));
+                    break;
+                case TapeOpKind::Transpose:
+                    if (node.axes.empty()) {
+                        values.push_back(values.at(node.lhs));
+                    } else {
+                        values.push_back(mlx::core::transpose(values.at(node.lhs), node.axes));
+                    }
+                    break;
+                case TapeOpKind::BroadcastInDim: {
+                    const mlx::core::array& a = values.at(node.lhs);
+                    if (node.shape.empty()) {
+                        values.push_back(a);
+                        break;
+                    }
+                    mlx::core::Shape inter_shape(node.shape.size(), 1);
+                    for (size_t i = 0; i < node.axes.size(); ++i) {
+                        inter_shape[node.axes[i]] = a.shape(static_cast<int>(i));
+                    }
+                    mlx::core::array r = (a.shape() == inter_shape)
+                        ? a
+                        : mlx::core::reshape(a, std::move(inter_shape));
+                    mlx::core::Shape target_shape = node.shape;
+                    for (size_t i = 0; i < target_shape.size(); ++i) {
+                        if (target_shape[i] == -1) {
+                            target_shape[i] = r.shape(static_cast<int>(i));
+                        } else if (target_shape[i] <= -2) {
+                            int32_t enc = -target_shape[i] - 2;
+                            int32_t ref_node = enc / 16;
+                            int ref_axis = enc % 16;
+                            target_shape[i] = values.at(ref_node).shape(ref_axis);
+                        }
+                    }
+                    if (r.shape() != target_shape) {
+                        r = mlx::core::broadcast_to(r, target_shape);
+                    }
+                    values.push_back(std::move(r));
+                    break;
+                }
+                case TapeOpKind::Slice: {
+                    const mlx::core::array& a = values.at(node.lhs);
+                    mlx::core::Shape stop = node.slice_stop;
+                    for (size_t i = 0; i < stop.size(); ++i) {
+                        if (stop[i] < 0) {
+                            stop[i] = a.shape(static_cast<int>(i));
+                        }
+                    }
+                    values.push_back(mlx::core::slice(a, node.slice_start, std::move(stop), node.slice_strides));
+                    break;
+                }
+                case TapeOpKind::Concatenate: {
+                    std::vector<mlx::core::array> arrs;
+                    arrs.reserve(node.inputs.size());
+                    for (int32_t id : node.inputs) {
+                        arrs.push_back(values.at(id));
+                    }
+                    values.push_back(mlx::core::concatenate(std::move(arrs), node.index));
+                    break;
+                }
+                case TapeOpKind::Reverse:
+                    if (node.axes.empty()) {
+                        values.push_back(values.at(node.lhs));
+                    } else {
+                        values.push_back(mlx::core::flip(values.at(node.lhs), node.axes));
+                    }
+                    break;
+                case TapeOpKind::Pad:
+                    values.push_back(mlx::core::pad(
+                        values.at(node.lhs),
+                        node.axes,
+                        node.slice_start,
+                        node.slice_stop,
+                        values.at(node.rhs)));
+                    break;
+                case TapeOpKind::Where:
+                    values.push_back(mlx::core::where(
+                        values.at(node.lhs),
+                        values.at(node.rhs),
+                        values.at(node.third)));
+                    break;
+                case TapeOpKind::Clamp:
+                    values.push_back(mlx::core::clip(
+                        values.at(node.lhs),
+                        values.at(node.rhs),
+                        values.at(node.third)));
+                    break;
+                case TapeOpKind::Reduce:
+                    values.push_back(evalReduceOp(node.index, values.at(node.lhs), node.axes));
+                    break;
+                case TapeOpKind::ArgMinMax: {
+                    const mlx::core::array& a = values.at(node.lhs);
+                    bool is_min = (node.rhs != 0);
+                    mlx::core::array res = is_min
+                        ? mlx::core::argmin(a, node.index, /*keepdims=*/false)
+                        : mlx::core::argmax(a, node.index, /*keepdims=*/false);
+                    if (res.dtype() != node.dtype) {
+                        res = mlx::core::astype(res, node.dtype);
+                    }
+                    values.push_back(std::move(res));
+                    break;
+                }
+                case TapeOpKind::Cumulative: {
+                    const mlx::core::array& a = values.at(node.lhs);
+                    int axis = node.index;
+                    bool reverse = (node.rhs & 1) != 0;
+                    bool inclusive = (node.rhs & 2) == 0;
+                    mlx::core::array res = a;
+                    if (node.third == MLX_CUMULATIVE_SUM) {
+                        if (a.dtype() == mlx::core::complex64) {
+                            mlx::core::array re = mlx::core::cumsum(
+                                mlx::core::real(a), axis, reverse, inclusive, mlx::core::float32);
+                            mlx::core::array im = mlx::core::cumsum(
+                                mlx::core::imag(a), axis, reverse, inclusive, mlx::core::float32);
+                            res = evalBinaryOp(MLX_BINARY_COMPLEX, re, im);
+                        } else {
+                            res = mlx::core::cumsum(a, axis, reverse, inclusive, a.dtype());
+                            if (res.dtype() != a.dtype()) {
+                                res = mlx::core::astype(res, a.dtype());
+                            }
+                        }
+                    } else {
+                        res = mlx::core::cummax(a, axis, reverse, inclusive);
+                        if (res.dtype() != a.dtype()) {
+                            res = mlx::core::astype(res, a.dtype());
+                        }
+                    }
+                    values.push_back(std::move(res));
+                    break;
+                }
+                case TapeOpKind::Matmul:
+                    values.push_back(evalMatmul(values.at(node.lhs), values.at(node.rhs)));
+                    break;
             }
         }
 
@@ -742,14 +1010,12 @@ int32_t mlx_tape_add_parameter(MLXTapeHandle handle, int dtype,
     tape->param_shapes.push_back(s);
 
     int32_t node_id = static_cast<int32_t>(tape->nodes.size());
-    tape->nodes.push_back(TapeNode{
-        TapeOpKind::Parameter,
-        param_idx,
-        -1,
-        -1,
-        dt,
-        std::move(s),
-    });
+    TapeNode node;
+    node.kind = TapeOpKind::Parameter;
+    node.index = param_idx;
+    node.dtype = dt;
+    node.shape = std::move(s);
+    tape->nodes.push_back(std::move(node));
     return node_id;
 }
 
@@ -778,14 +1044,12 @@ int32_t mlx_tape_add_constant(MLXTapeHandle handle, const void* src, int64_t nby
         tape->constants.emplace_back(std::move(data), s, dt);
 
         int32_t node_id = static_cast<int32_t>(tape->nodes.size());
-        tape->nodes.push_back(TapeNode{
-            TapeOpKind::Constant,
-            const_idx,
-            -1,
-            -1,
-            dt,
-            std::move(s),
-        });
+        TapeNode node;
+        node.kind = TapeOpKind::Constant;
+        node.index = const_idx;
+        node.dtype = dt;
+        node.shape = std::move(s);
+        tape->nodes.push_back(std::move(node));
         return node_id;
     } catch (const std::exception& e) {
         setError(error, 4, std::string("mlx_tape_add_constant: ") + e.what());
@@ -805,14 +1069,11 @@ int32_t mlx_tape_add_unary(MLXTapeHandle handle, int op, int32_t input, MLXError
         return -1;
     }
     int32_t node_id = static_cast<int32_t>(tape->nodes.size());
-    tape->nodes.push_back(TapeNode{
-        TapeOpKind::Unary,
-        op,
-        input,
-        -1,
-        mlx::core::float32,
-        {},
-    });
+    TapeNode node;
+    node.kind = TapeOpKind::Unary;
+    node.index = op;
+    node.lhs = input;
+    tape->nodes.push_back(std::move(node));
     return node_id;
 }
 
@@ -829,14 +1090,12 @@ int32_t mlx_tape_add_binary(MLXTapeHandle handle, int op, int32_t lhs, int32_t r
         return -1;
     }
     int32_t node_id = static_cast<int32_t>(tape->nodes.size());
-    tape->nodes.push_back(TapeNode{
-        TapeOpKind::Binary,
-        op,
-        lhs,
-        rhs,
-        mlx::core::float32,
-        {},
-    });
+    TapeNode node;
+    node.kind = TapeOpKind::Binary;
+    node.index = op;
+    node.lhs = lhs;
+    node.rhs = rhs;
+    tape->nodes.push_back(std::move(node));
     return node_id;
 }
 
@@ -858,14 +1117,11 @@ int32_t mlx_tape_add_convert_dtype(MLXTapeHandle handle, int32_t input, int targ
         return -1;
     }
     int32_t node_id = static_cast<int32_t>(tape->nodes.size());
-    tape->nodes.push_back(TapeNode{
-        TapeOpKind::ConvertDType,
-        0,
-        input,
-        -1,
-        dt,
-        {},
-    });
+    TapeNode node;
+    node.kind = TapeOpKind::ConvertDType;
+    node.lhs = input;
+    node.dtype = dt;
+    tape->nodes.push_back(std::move(node));
     return node_id;
 }
 
@@ -889,14 +1145,12 @@ int32_t mlx_tape_add_bitcast(MLXTapeHandle handle, int32_t input, int target_dty
     }
     mlx::core::Shape s = toMLXShape(out_shape, out_rank);
     int32_t node_id = static_cast<int32_t>(tape->nodes.size());
-    tape->nodes.push_back(TapeNode{
-        TapeOpKind::Bitcast,
-        0,
-        input,
-        -1,
-        dt,
-        std::move(s),
-    });
+    TapeNode node;
+    node.kind = TapeOpKind::Bitcast;
+    node.lhs = input;
+    node.dtype = dt;
+    node.shape = std::move(s);
+    tape->nodes.push_back(std::move(node));
     return node_id;
 }
 
@@ -916,14 +1170,324 @@ int32_t mlx_tape_add_iota(MLXTapeHandle handle, int dtype,
     auto* tape = static_cast<MLXTape*>(handle);
     mlx::core::Shape s = toMLXShape(shape, rank);
     int32_t node_id = static_cast<int32_t>(tape->nodes.size());
-    tape->nodes.push_back(TapeNode{
-        TapeOpKind::Iota,
-        iota_axis,
-        -1,
-        -1,
-        dt,
-        std::move(s),
-    });
+    TapeNode node;
+    node.kind = TapeOpKind::Iota;
+    node.index = iota_axis;
+    node.dtype = dt;
+    node.shape = std::move(s);
+    tape->nodes.push_back(std::move(node));
+    return node_id;
+}
+
+int32_t mlx_tape_add_reshape(MLXTapeHandle handle, int32_t input,
+    const int32_t* shape, int rank, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_reshape: null tape handle");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    if (input < 0 || static_cast<size_t>(input) >= tape->nodes.size()) {
+        setError(error, 2, "mlx_tape_add_reshape: invalid input node ID");
+        return -1;
+    }
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    TapeNode node;
+    node.kind = TapeOpKind::Reshape;
+    node.lhs = input;
+    node.shape = toMLXShape(shape, rank);
+    tape->nodes.push_back(std::move(node));
+    return node_id;
+}
+
+int32_t mlx_tape_add_transpose(MLXTapeHandle handle, int32_t input,
+    const int32_t* axes, int rank, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_transpose: null tape handle");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    if (input < 0 || static_cast<size_t>(input) >= tape->nodes.size()) {
+        setError(error, 2, "mlx_tape_add_transpose: invalid input node ID");
+        return -1;
+    }
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    TapeNode node;
+    node.kind = TapeOpKind::Transpose;
+    node.lhs = input;
+    if (rank > 0 && axes != nullptr) {
+        node.axes.assign(axes, axes + rank);
+    }
+    tape->nodes.push_back(std::move(node));
+    return node_id;
+}
+
+int32_t mlx_tape_add_broadcast_in_dim(MLXTapeHandle handle, int32_t input,
+    const int32_t* out_shape, int out_rank,
+    const int32_t* broadcast_axes, int num_broadcast_axes, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_broadcast_in_dim: null tape handle");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    if (input < 0 || static_cast<size_t>(input) >= tape->nodes.size()) {
+        setError(error, 2, "mlx_tape_add_broadcast_in_dim: invalid input node ID");
+        return -1;
+    }
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    TapeNode node;
+    node.kind = TapeOpKind::BroadcastInDim;
+    node.lhs = input;
+    node.shape = toMLXShape(out_shape, out_rank);
+    if (num_broadcast_axes > 0 && broadcast_axes != nullptr) {
+        node.axes.assign(broadcast_axes, broadcast_axes + num_broadcast_axes);
+    }
+    tape->nodes.push_back(std::move(node));
+    return node_id;
+}
+
+int32_t mlx_tape_add_slice(MLXTapeHandle handle, int32_t input,
+    const int32_t* starts, const int32_t* limits, const int32_t* strides, int rank, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_slice: null tape handle");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    if (input < 0 || static_cast<size_t>(input) >= tape->nodes.size()) {
+        setError(error, 2, "mlx_tape_add_slice: invalid input node ID");
+        return -1;
+    }
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    TapeNode node;
+    node.kind = TapeOpKind::Slice;
+    node.lhs = input;
+    node.slice_start = toMLXShape(starts, rank);
+    node.slice_stop = toMLXShape(limits, rank);
+    node.slice_strides = toMLXShape(strides, rank);
+    tape->nodes.push_back(std::move(node));
+    return node_id;
+}
+
+int32_t mlx_tape_add_concatenate(MLXTapeHandle handle,
+    const int32_t* inputs, int num_inputs, int axis, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_concatenate: null tape handle");
+        return -1;
+    }
+    if (num_inputs <= 0 || inputs == nullptr) {
+        setError(error, 2, "mlx_tape_add_concatenate: at least one input is required");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    for (int i = 0; i < num_inputs; ++i) {
+        if (inputs[i] < 0 || static_cast<size_t>(inputs[i]) >= tape->nodes.size()) {
+            setError(error, 2, "mlx_tape_add_concatenate: invalid input node ID");
+            return -1;
+        }
+    }
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    TapeNode node;
+    node.kind = TapeOpKind::Concatenate;
+    node.index = axis;
+    node.inputs.assign(inputs, inputs + num_inputs);
+    tape->nodes.push_back(std::move(node));
+    return node_id;
+}
+
+int32_t mlx_tape_add_reverse(MLXTapeHandle handle, int32_t input,
+    const int32_t* axes, int num_axes, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_reverse: null tape handle");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    if (input < 0 || static_cast<size_t>(input) >= tape->nodes.size()) {
+        setError(error, 2, "mlx_tape_add_reverse: invalid input node ID");
+        return -1;
+    }
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    TapeNode node;
+    node.kind = TapeOpKind::Reverse;
+    node.lhs = input;
+    if (num_axes > 0 && axes != nullptr) {
+        node.axes.assign(axes, axes + num_axes);
+    }
+    tape->nodes.push_back(std::move(node));
+    return node_id;
+}
+
+int32_t mlx_tape_add_pad(MLXTapeHandle handle, int32_t input, int32_t fill_value,
+    const int32_t* axes, const int32_t* low_pad, const int32_t* high_pad, int num_axes, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_pad: null tape handle");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    if (input < 0 || static_cast<size_t>(input) >= tape->nodes.size() ||
+        fill_value < 0 || static_cast<size_t>(fill_value) >= tape->nodes.size()) {
+        setError(error, 2, "mlx_tape_add_pad: invalid operand node ID");
+        return -1;
+    }
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    TapeNode node;
+    node.kind = TapeOpKind::Pad;
+    node.lhs = input;
+    node.rhs = fill_value;
+    if (num_axes > 0 && axes != nullptr) {
+        node.axes.assign(axes, axes + num_axes);
+    }
+    node.slice_start = toMLXShape(low_pad, num_axes);
+    node.slice_stop = toMLXShape(high_pad, num_axes);
+    tape->nodes.push_back(std::move(node));
+    return node_id;
+}
+
+int32_t mlx_tape_add_where(MLXTapeHandle handle, int32_t cond, int32_t on_true, int32_t on_false, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_where: null tape handle");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    if (cond < 0 || static_cast<size_t>(cond) >= tape->nodes.size() ||
+        on_true < 0 || static_cast<size_t>(on_true) >= tape->nodes.size() ||
+        on_false < 0 || static_cast<size_t>(on_false) >= tape->nodes.size()) {
+        setError(error, 2, "mlx_tape_add_where: invalid operand node ID");
+        return -1;
+    }
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    TapeNode node;
+    node.kind = TapeOpKind::Where;
+    node.lhs = cond;
+    node.rhs = on_true;
+    node.third = on_false;
+    tape->nodes.push_back(std::move(node));
+    return node_id;
+}
+
+int32_t mlx_tape_add_clamp(MLXTapeHandle handle, int32_t min_val, int32_t input, int32_t max_val, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_clamp: null tape handle");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    if (min_val < 0 || static_cast<size_t>(min_val) >= tape->nodes.size() ||
+        input < 0 || static_cast<size_t>(input) >= tape->nodes.size() ||
+        max_val < 0 || static_cast<size_t>(max_val) >= tape->nodes.size()) {
+        setError(error, 2, "mlx_tape_add_clamp: invalid operand node ID");
+        return -1;
+    }
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    TapeNode node;
+    node.kind = TapeOpKind::Clamp;
+    node.lhs = input;
+    node.rhs = min_val;
+    node.third = max_val;
+    tape->nodes.push_back(std::move(node));
+    return node_id;
+}
+
+int32_t mlx_tape_add_reduce(MLXTapeHandle handle, int op, int32_t input,
+    const int32_t* axes, int num_axes, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_reduce: null tape handle");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    if (input < 0 || static_cast<size_t>(input) >= tape->nodes.size()) {
+        setError(error, 2, "mlx_tape_add_reduce: invalid input node ID");
+        return -1;
+    }
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    TapeNode node;
+    node.kind = TapeOpKind::Reduce;
+    node.index = op;
+    node.lhs = input;
+    if (num_axes > 0 && axes != nullptr) {
+        node.axes.assign(axes, axes + num_axes);
+    }
+    tape->nodes.push_back(std::move(node));
+    return node_id;
+}
+
+int32_t mlx_tape_add_arg_min_max(MLXTapeHandle handle, int32_t input,
+    int axis, bool is_min, int output_dtype, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_arg_min_max: null tape handle");
+        return -1;
+    }
+    bool ok = false;
+    mlx::core::Dtype dt = toMLXDType(output_dtype, &ok);
+    if (!ok) {
+        setError(error, 3, "mlx_tape_add_arg_min_max: unsupported output dtype");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    if (input < 0 || static_cast<size_t>(input) >= tape->nodes.size()) {
+        setError(error, 2, "mlx_tape_add_arg_min_max: invalid input node ID");
+        return -1;
+    }
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    TapeNode node;
+    node.kind = TapeOpKind::ArgMinMax;
+    node.index = axis;
+    node.lhs = input;
+    node.rhs = is_min ? 1 : 0;
+    node.dtype = dt;
+    tape->nodes.push_back(std::move(node));
+    return node_id;
+}
+
+int32_t mlx_tape_add_cumulative(MLXTapeHandle handle, int op, int32_t input,
+    int axis, bool reverse, bool exclusive, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_cumulative: null tape handle");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    if (input < 0 || static_cast<size_t>(input) >= tape->nodes.size()) {
+        setError(error, 2, "mlx_tape_add_cumulative: invalid input node ID");
+        return -1;
+    }
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    TapeNode node;
+    node.kind = TapeOpKind::Cumulative;
+    node.index = axis;
+    node.lhs = input;
+    node.rhs = (reverse ? 1 : 0) | (exclusive ? 2 : 0);
+    node.third = op;
+    tape->nodes.push_back(std::move(node));
+    return node_id;
+}
+
+int32_t mlx_tape_add_matmul(MLXTapeHandle handle, int32_t lhs, int32_t rhs, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_matmul: null tape handle");
+        return -1;
+    }
+    auto* tape = static_cast<MLXTape*>(handle);
+    if (lhs < 0 || static_cast<size_t>(lhs) >= tape->nodes.size() ||
+        rhs < 0 || static_cast<size_t>(rhs) >= tape->nodes.size()) {
+        setError(error, 2, "mlx_tape_add_matmul: invalid operand node ID");
+        return -1;
+    }
+    int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+    TapeNode node;
+    node.kind = TapeOpKind::Matmul;
+    node.lhs = lhs;
+    node.rhs = rhs;
+    tape->nodes.push_back(std::move(node));
     return node_id;
 }
 
@@ -1101,6 +1665,71 @@ int32_t mlx_tape_add_bitcast(MLXTapeHandle, int32_t, int, const int32_t*, int, M
 }
 
 int32_t mlx_tape_add_iota(MLXTapeHandle, int, const int32_t*, int, int, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_reshape(MLXTapeHandle, int32_t, const int32_t*, int, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_transpose(MLXTapeHandle, int32_t, const int32_t*, int, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_broadcast_in_dim(MLXTapeHandle, int32_t, const int32_t*, int, const int32_t*, int, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_slice(MLXTapeHandle, int32_t, const int32_t*, const int32_t*, const int32_t*, int, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_concatenate(MLXTapeHandle, const int32_t*, int, int, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_reverse(MLXTapeHandle, int32_t, const int32_t*, int, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_pad(MLXTapeHandle, int32_t, int32_t, const int32_t*, const int32_t*, const int32_t*, int, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_where(MLXTapeHandle, int32_t, int32_t, int32_t, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_clamp(MLXTapeHandle, int32_t, int32_t, int32_t, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_reduce(MLXTapeHandle, int, int32_t, const int32_t*, int, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_arg_min_max(MLXTapeHandle, int32_t, int, bool, int, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_cumulative(MLXTapeHandle, int, int32_t, int, bool, bool, MLXError* error) {
+    setError(error, 1, kInstallHelpMsg);
+    return -1;
+}
+
+int32_t mlx_tape_add_matmul(MLXTapeHandle, int32_t, int32_t, MLXError* error) {
     setError(error, 1, kInstallHelpMsg);
     return -1;
 }
