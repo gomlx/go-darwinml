@@ -6,12 +6,14 @@ package mlx
 
 import (
 	"runtime"
+	"slices"
 
 	"github.com/gomlx/compute"
 	"github.com/gomlx/compute/dtypes"
 	"github.com/gomlx/compute/notimplemented"
 	"github.com/gomlx/compute/shapeinference"
 	"github.com/gomlx/compute/shapes"
+	"github.com/gomlx/compute/support/sets"
 	"github.com/gomlx/go-darwinml/internal/mlxbridge"
 	"github.com/pkg/errors"
 )
@@ -645,4 +647,567 @@ func (f *Function) GreaterThanTotalOrder(lhs, rhs compute.Value) (compute.Value,
 
 func (f *Function) GreaterOrEqualTotalOrder(lhs, rhs compute.Value) (compute.Value, error) {
 	return f.GreaterOrEqual(lhs, rhs)
+}
+
+// ===========================================================================
+// Shape Manipulation Operations
+// ===========================================================================
+
+// knownDynamicAxisNames returns all named dynamic axes from this function's parameters and its ancestors.
+func (f *Function) knownDynamicAxisNames() sets.Set[string] {
+	var names sets.Set[string]
+	for cur := f; cur != nil; cur = cur.parent {
+		for _, p := range cur.params {
+			for axis, d := range p.shape.Dimensions {
+				if d == shapes.DynamicDim {
+					name := p.shape.AxisName(axis)
+					if name != "" && name != shapes.AnonymousAxis {
+						if names == nil {
+							names = sets.Make[string]()
+						}
+						names.Insert(name)
+					}
+				}
+			}
+		}
+	}
+	return names
+}
+
+// findDynamicAxisSource returns the parameter node ID and axis index that defines the given dynamic axis name.
+func (f *Function) findDynamicAxisSource(axisName string) (mlxbridge.NodeID, int, bool) {
+	if axisName == "" || axisName == shapes.AnonymousAxis {
+		return -1, -1, false
+	}
+	for cur := f; cur != nil; cur = cur.parent {
+		for _, p := range cur.params {
+			for axis, d := range p.shape.Dimensions {
+				if d == shapes.DynamicDim && p.shape.AxisName(axis) == axisName {
+					return p.id, axis, true
+				}
+			}
+		}
+	}
+	return -1, -1, false
+}
+
+// Reshape reshapes x to the given dimensions.
+func (f *Function) Reshape(x compute.Value, dimensions ...int) (compute.Value, error) {
+	node, err := f.resolveNode(x)
+	if err != nil {
+		return nil, errors.Wrap(err, "Reshape")
+	}
+	outShape, err := shapeinference.Reshape(node.shape, dimensions)
+	if err != nil {
+		return nil, errors.Wrap(err, "Reshape")
+	}
+	id, err := f.builder.tape.AddReshape(node.id, outShape.Dimensions)
+	if err != nil {
+		return nil, errors.Wrap(err, "Reshape")
+	}
+	return &graphNode{id: id, shape: outShape, owner: f}, nil
+}
+
+// Transpose permutes the dimensions of x according to permutation.
+func (f *Function) Transpose(x compute.Value, permutation ...int) (compute.Value, error) {
+	node, err := f.resolveNode(x)
+	if err != nil {
+		return nil, errors.Wrap(err, "Transpose")
+	}
+	outShape, err := shapeinference.Transpose(node.shape, permutation)
+	if err != nil {
+		return nil, errors.Wrap(err, "Transpose")
+	}
+	id, err := f.builder.tape.AddTranspose(node.id, permutation)
+	if err != nil {
+		return nil, errors.Wrap(err, "Transpose")
+	}
+	return &graphNode{id: id, shape: outShape, owner: f}, nil
+}
+
+// BroadcastInDim broadcasts operand to outputShape mapping operand's i-th axis to broadcastAxes[i].
+func (f *Function) BroadcastInDim(operand compute.Value, outputShape shapes.Shape, broadcastAxes []int) (compute.Value, error) {
+	if err := f.builder.backend.checkDTypeSupported(outputShape.DType); err != nil {
+		return nil, errors.Wrap(err, "BroadcastInDim")
+	}
+	node, err := f.resolveNode(operand)
+	if err != nil {
+		return nil, errors.Wrap(err, "BroadcastInDim")
+	}
+	if node.shape.DType != outputShape.DType {
+		return nil, errors.Errorf("BroadcastInDim: operand dtype (%s) and outputShape dtype (%s) must match",
+			node.shape.DType, outputShape.DType)
+	}
+	if err := shapeinference.BroadcastInDim(node.shape, outputShape, broadcastAxes, f.knownDynamicAxisNames()); err != nil {
+		return nil, errors.Wrap(err, "BroadcastInDim")
+	}
+
+	// Build target shape dimensions for the tape, encoding newly introduced dynamic axes
+	// as references to their source parameter node and axis.
+	targetDims := slices.Clone(outputShape.Dimensions)
+	if outputShape.IsDynamic() {
+		preservedDynamic := make(map[int]bool, len(broadcastAxes))
+		for inAx, outAx := range broadcastAxes {
+			if node.shape.Dimensions[inAx] == shapes.DynamicDim {
+				preservedDynamic[outAx] = true
+			}
+		}
+		for outAx, d := range targetDims {
+			if d == shapes.DynamicDim && !preservedDynamic[outAx] {
+				name := outputShape.AxisName(outAx)
+				paramID, paramAx, ok := f.findDynamicAxisSource(name)
+				if !ok {
+					return nil, errors.Errorf("BroadcastInDim: unknown dynamic axis %q at output axis %d", name, outAx)
+				}
+				targetDims[outAx] = -(2 + int(paramID)*16 + paramAx)
+			}
+		}
+	}
+
+	id, err := f.builder.tape.AddBroadcastInDim(node.id, targetDims, broadcastAxes)
+	if err != nil {
+		return nil, errors.Wrap(err, "BroadcastInDim")
+	}
+	return &graphNode{id: id, shape: outputShape.Clone(), owner: f}, nil
+}
+
+// Slice extracts a slice from operand specified by starts, limits, and strides.
+func (f *Function) Slice(operand compute.Value, starts, limits, strides []int) (compute.Value, error) {
+	node, err := f.resolveNode(operand)
+	if err != nil {
+		return nil, errors.Wrap(err, "Slice")
+	}
+	outShape, err := shapeinference.Slice(node.shape, starts, limits, strides)
+	if err != nil {
+		return nil, errors.Wrap(err, "Slice")
+	}
+	id, err := f.builder.tape.AddSlice(node.id, starts, limits, strides)
+	if err != nil {
+		return nil, errors.Wrap(err, "Slice")
+	}
+	return &graphNode{id: id, shape: outShape, owner: f}, nil
+}
+
+// Concatenate joins operands along axis.
+func (f *Function) Concatenate(axis int, operands ...compute.Value) (compute.Value, error) {
+	nodes, err := f.resolveNodes("Concatenate", operands...)
+	if err != nil {
+		return nil, err
+	}
+	if len(nodes) == 1 {
+		return f.Identity(nodes[0])
+	}
+	inputShapes := make([]shapes.Shape, len(nodes))
+	inputIDs := make([]mlxbridge.NodeID, len(nodes))
+	for i, n := range nodes {
+		inputShapes[i] = n.shape
+		inputIDs[i] = n.id
+	}
+	outShape, err := shapeinference.Concatenate(inputShapes, axis)
+	if err != nil {
+		return nil, errors.Wrap(err, "Concatenate")
+	}
+	id, err := f.builder.tape.AddConcatenate(inputIDs, axis)
+	if err != nil {
+		return nil, errors.Wrap(err, "Concatenate")
+	}
+	return &graphNode{id: id, shape: outShape, owner: f}, nil
+}
+
+// Reverse reverses the elements of x along the specified axes.
+func (f *Function) Reverse(x compute.Value, axes ...int) (compute.Value, error) {
+	node, err := f.resolveNode(x)
+	if err != nil {
+		return nil, errors.Wrap(err, "Reverse")
+	}
+	rank := node.shape.Rank()
+	normAxes := make([]int, len(axes))
+	seen := sets.Make[int](len(axes))
+	for i, a := range axes {
+		if a < 0 {
+			a += rank
+		}
+		if a < 0 || a >= rank {
+			return nil, errors.Errorf("Reverse: axis %d out of bounds for shape %s", axes[i], node.shape)
+		}
+		if seen.Has(a) {
+			return nil, errors.Errorf("Reverse: duplicate axis %d", a)
+		}
+		seen.Insert(a)
+		normAxes[i] = a
+	}
+	if len(normAxes) == 0 {
+		return f.Identity(node)
+	}
+	id, err := f.builder.tape.AddReverse(node.id, normAxes)
+	if err != nil {
+		return nil, errors.Wrap(err, "Reverse")
+	}
+	return &graphNode{id: id, shape: node.shape.Clone(), owner: f}, nil
+}
+
+// Pad injects padding on the start, end, or interior of operand.
+func (f *Function) Pad(operand, fillValue compute.Value, axesConfig ...compute.PadAxis) (compute.Value, error) {
+	opNode, err := f.resolveNode(operand)
+	if err != nil {
+		return nil, errors.Wrap(err, "Pad: operand")
+	}
+	fillNode, err := f.resolveNode(fillValue)
+	if err != nil {
+		return nil, errors.Wrap(err, "Pad: fillValue")
+	}
+	if fillNode.shape.Rank() != 0 || fillNode.shape.DType != opNode.shape.DType {
+		return nil, errors.Errorf("Pad: fillValue must be scalar of dtype %s, got %s", opNode.shape.DType, fillNode.shape)
+	}
+	outShape, err := shapeinference.Pad(opNode.shape, axesConfig...)
+	if err != nil {
+		return nil, errors.Wrap(err, "Pad")
+	}
+	if !outShape.IsDynamic() && outShape.Size() == 0 {
+		id, err := f.builder.tape.AddConstant(nil, 0, dtypeToBridgeDType(outShape.DType), outShape.Dimensions)
+		if err != nil {
+			return nil, errors.Wrap(err, "Pad: zero-sized output")
+		}
+		return &graphNode{id: id, shape: outShape, owner: f}, nil
+	}
+	if !opNode.shape.IsDynamic() && opNode.shape.Size() == 0 {
+		return f.BroadcastInDim(fillNode, outShape, nil)
+	}
+
+	rank := opNode.shape.Rank()
+	fullConfig := make([]compute.PadAxis, rank)
+	copy(fullConfig, axesConfig)
+
+	curID := opNode.id
+	curShape := slices.Clone(opNode.shape.Dimensions)
+	didWork := false
+
+	// Step 1: Handle interior padding per axis by reshaping [N] -> [N, 1],
+	// padding the new axis with ac.Interior, flattening to [N*(ac.Interior+1)],
+	// and slicing off the trailing ac.Interior elements to [(N-1)*ac.Interior + N].
+	for i, ac := range fullConfig {
+		if ac.Interior > 0 && curShape[i] > 1 {
+			n := curShape[i]
+			dilation := ac.Interior + 1
+
+			reshapeDims := make([]int, rank+1)
+			copy(reshapeDims[:i], curShape[:i])
+			reshapeDims[i] = n
+			reshapeDims[i+1] = 1
+			copy(reshapeDims[i+2:], curShape[i+1:])
+
+			curID, err = f.builder.tape.AddReshape(curID, reshapeDims)
+			if err != nil {
+				return nil, errors.Wrapf(err, "Pad: interior reshape axis %d", i)
+			}
+
+			curID, err = f.builder.tape.AddPad(curID, fillNode.id, []int{i + 1}, []int{0}, []int{ac.Interior})
+			if err != nil {
+				return nil, errors.Wrapf(err, "Pad: interior pad axis %d", i)
+			}
+
+			flatDims := slices.Clone(curShape)
+			flatDims[i] = n * dilation
+			curID, err = f.builder.tape.AddReshape(curID, flatDims)
+			if err != nil {
+				return nil, errors.Wrapf(err, "Pad: interior flatten axis %d", i)
+			}
+
+			dilatedSize := n + (n-1)*ac.Interior
+			starts := make([]int, rank)
+			limits := slices.Clone(flatDims)
+			strides := make([]int, rank)
+			for ax := range rank {
+				strides[ax] = 1
+			}
+			limits[i] = dilatedSize
+			curID, err = f.builder.tape.AddSlice(curID, starts, limits, strides)
+			if err != nil {
+				return nil, errors.Wrapf(err, "Pad: interior slice axis %d", i)
+			}
+
+			curShape[i] = dilatedSize
+			didWork = true
+		}
+	}
+
+	// Step 2: Handle negative Start / End padding (cropping) via Slice.
+	hasCrop := false
+	cropStarts := make([]int, rank)
+	cropLimits := slices.Clone(curShape)
+	cropStrides := make([]int, rank)
+	for i, ac := range fullConfig {
+		cropStrides[i] = 1
+		if ac.Start < 0 {
+			cropStarts[i] = -ac.Start
+			hasCrop = true
+		}
+		if ac.End < 0 {
+			cropLimits[i] = curShape[i] + ac.End
+			hasCrop = true
+		}
+	}
+	if hasCrop {
+		curID, err = f.builder.tape.AddSlice(curID, cropStarts, cropLimits, cropStrides)
+		if err != nil {
+			return nil, errors.Wrap(err, "Pad: negative padding slice")
+		}
+		for i := range rank {
+			if curShape[i] != shapes.DynamicDim {
+				curShape[i] = cropLimits[i] - cropStarts[i]
+			}
+		}
+		didWork = true
+	}
+
+	// Step 3: Handle positive Start / End padding via Pad.
+	var padAxes, lowPads, highPads []int
+	for i, ac := range fullConfig {
+		low := max(0, ac.Start)
+		high := max(0, ac.End)
+		if low > 0 || high > 0 {
+			padAxes = append(padAxes, i)
+			lowPads = append(lowPads, low)
+			highPads = append(highPads, high)
+		}
+	}
+	if len(padAxes) > 0 {
+		curID, err = f.builder.tape.AddPad(curID, fillNode.id, padAxes, lowPads, highPads)
+		if err != nil {
+			return nil, errors.Wrap(err, "Pad: edge pad")
+		}
+		didWork = true
+	}
+
+	if !didWork {
+		return f.Identity(opNode)
+	}
+	return &graphNode{id: curID, shape: outShape, owner: f}, nil
+}
+
+// ===========================================================================
+// Selection Operations (Where, Clamp)
+// ===========================================================================
+
+// Where selects elements from onTrue or onFalse depending on condition.
+func (f *Function) Where(condition, onTrue, onFalse compute.Value) (compute.Value, error) {
+	nodes, err := f.resolveNodes("Where", condition, onTrue, onFalse)
+	if err != nil {
+		return nil, err
+	}
+	outShape, err := shapeinference.Where(nodes[0].shape, nodes[1].shape, nodes[2].shape)
+	if err != nil {
+		return nil, errors.Wrap(err, "Where")
+	}
+	id, err := f.builder.tape.AddWhere(nodes[0].id, nodes[1].id, nodes[2].id)
+	if err != nil {
+		return nil, errors.Wrap(err, "Where")
+	}
+	return &graphNode{id: id, shape: outShape, owner: f}, nil
+}
+
+// Clamp clamps x element-wise between min and max.
+func (f *Function) Clamp(minVal, x, maxVal compute.Value) (compute.Value, error) {
+	nodes, err := f.resolveNodes("Clamp", minVal, x, maxVal)
+	if err != nil {
+		return nil, err
+	}
+	dt := nodes[1].shape.DType
+	if nodes[0].shape.DType != dt || nodes[2].shape.DType != dt {
+		return nil, errors.Errorf("Clamp: min (%s), x (%s), and max (%s) must have matching dtypes",
+			nodes[0].shape, nodes[1].shape, nodes[2].shape)
+	}
+	if !dt.IsFloat() && !dt.IsInt() {
+		return nil, errors.Errorf("Clamp: requires float or integer dtype, got %s", dt)
+	}
+	if !nodes[0].shape.IsScalar() && !nodes[0].shape.EqualDimensions(nodes[1].shape) {
+		if _, err := shapeinference.BinaryOp(compute.OpTypeMax, nodes[0].shape, nodes[1].shape); err != nil {
+			return nil, errors.Wrap(err, "Clamp: min shape incompatible with x")
+		}
+	}
+	if !nodes[2].shape.IsScalar() && !nodes[2].shape.EqualDimensions(nodes[1].shape) {
+		if _, err := shapeinference.BinaryOp(compute.OpTypeMin, nodes[1].shape, nodes[2].shape); err != nil {
+			return nil, errors.Wrap(err, "Clamp: max shape incompatible with x")
+		}
+	}
+	id, err := f.builder.tape.AddClamp(nodes[0].id, nodes[1].id, nodes[2].id)
+	if err != nil {
+		return nil, errors.Wrap(err, "Clamp")
+	}
+	return &graphNode{id: id, shape: nodes[1].shape.Clone(), owner: f}, nil
+}
+
+// ===========================================================================
+// Reduction Operations
+// ===========================================================================
+
+func (f *Function) reduceOp(opName string, mlxOp mlxbridge.ReduceOp, x compute.Value, axes ...int) (compute.Value, error) {
+	node, err := f.resolveNode(x)
+	if err != nil {
+		return nil, errors.Wrap(err, opName)
+	}
+	dt := node.shape.DType
+	switch mlxOp {
+	case mlxbridge.ReduceLogicalAnd, mlxbridge.ReduceLogicalOr, mlxbridge.ReduceLogicalXor:
+		if dt != dtypes.Bool {
+			return nil, errors.Errorf("%s: requires Bool operand, got %s", opName, node.shape)
+		}
+	case mlxbridge.ReduceBitwiseAnd, mlxbridge.ReduceBitwiseOr, mlxbridge.ReduceBitwiseXor:
+		if !dt.IsInt() {
+			return nil, errors.Errorf("%s: requires integer operand, got %s", opName, node.shape)
+		}
+	case mlxbridge.ReduceMax, mlxbridge.ReduceMin:
+		if !dt.IsFloat() && !dt.IsInt() && dt != dtypes.Bool {
+			return nil, errors.Errorf("%s: requires float, integer, or bool operand, got %s", opName, node.shape)
+		}
+	case mlxbridge.ReduceSum, mlxbridge.ReduceProduct:
+		if !dt.IsFloat() && !dt.IsInt() && !dt.IsComplex() {
+			return nil, errors.Errorf("%s: requires numeric operand, got %s", opName, node.shape)
+		}
+	}
+
+	rank := node.shape.Rank()
+	if len(axes) == 0 {
+		if rank == 0 {
+			return f.Identity(node)
+		}
+		axes = make([]int, rank)
+		for i := range axes {
+			axes[i] = i
+		}
+	} else {
+		norm := make([]int, len(axes))
+		seen := sets.Make[int](len(axes))
+		for i, a := range axes {
+			if a < 0 {
+				a += rank
+			}
+			if a < 0 || a >= rank {
+				return nil, errors.Errorf("%s: axis %d out of bounds for shape %s", opName, axes[i], node.shape)
+			}
+			if seen.Has(a) {
+				return nil, errors.Errorf("%s: duplicate reduction axis %d", opName, a)
+			}
+			seen.Insert(a)
+			norm[i] = a
+		}
+		axes = norm
+	}
+
+	outShape, err := shapeinference.Reduce(node.shape, axes)
+	if err != nil {
+		return nil, errors.Wrap(err, opName)
+	}
+	id, err := f.builder.tape.AddReduce(mlxOp, node.id, axes)
+	if err != nil {
+		return nil, errors.Wrap(err, opName)
+	}
+	return &graphNode{id: id, shape: outShape, owner: f}, nil
+}
+
+func (f *Function) ReduceSum(x compute.Value, axes ...int) (compute.Value, error) {
+	return f.reduceOp("ReduceSum", mlxbridge.ReduceSum, x, axes...)
+}
+
+func (f *Function) ReduceProduct(x compute.Value, axes ...int) (compute.Value, error) {
+	return f.reduceOp("ReduceProduct", mlxbridge.ReduceProduct, x, axes...)
+}
+
+func (f *Function) ReduceMax(x compute.Value, axes ...int) (compute.Value, error) {
+	return f.reduceOp("ReduceMax", mlxbridge.ReduceMax, x, axes...)
+}
+
+func (f *Function) ReduceMin(x compute.Value, axes ...int) (compute.Value, error) {
+	return f.reduceOp("ReduceMin", mlxbridge.ReduceMin, x, axes...)
+}
+
+func (f *Function) ReduceLogicalAnd(x compute.Value, axes ...int) (compute.Value, error) {
+	return f.reduceOp("ReduceLogicalAnd", mlxbridge.ReduceLogicalAnd, x, axes...)
+}
+
+func (f *Function) ReduceLogicalOr(x compute.Value, axes ...int) (compute.Value, error) {
+	return f.reduceOp("ReduceLogicalOr", mlxbridge.ReduceLogicalOr, x, axes...)
+}
+
+func (f *Function) ReduceLogicalXor(x compute.Value, axes ...int) (compute.Value, error) {
+	return f.reduceOp("ReduceLogicalXor", mlxbridge.ReduceLogicalXor, x, axes...)
+}
+
+func (f *Function) ReduceBitwiseAnd(x compute.Value, axes ...int) (compute.Value, error) {
+	return f.reduceOp("ReduceBitwiseAnd", mlxbridge.ReduceBitwiseAnd, x, axes...)
+}
+
+func (f *Function) ReduceBitwiseOr(x compute.Value, axes ...int) (compute.Value, error) {
+	return f.reduceOp("ReduceBitwiseOr", mlxbridge.ReduceBitwiseOr, x, axes...)
+}
+
+func (f *Function) ReduceBitwiseXor(x compute.Value, axes ...int) (compute.Value, error) {
+	return f.reduceOp("ReduceBitwiseXor", mlxbridge.ReduceBitwiseXor, x, axes...)
+}
+
+// ===========================================================================
+// ArgMinMax & Cumulative Operations
+// ===========================================================================
+
+// ArgMinMax calculates the argmin or argmax across an axis of x.
+func (f *Function) ArgMinMax(x compute.Value, axis int, outputDType dtypes.DType, isMin bool) (compute.Value, error) {
+	if err := f.builder.backend.checkDTypeSupported(outputDType); err != nil {
+		return nil, errors.Wrap(err, "ArgMinMax")
+	}
+	node, err := f.resolveNode(x)
+	if err != nil {
+		return nil, errors.Wrap(err, "ArgMinMax")
+	}
+	if axis < 0 {
+		axis += node.shape.Rank()
+	}
+	outShape, err := shapeinference.ArgMinMax(node.shape, axis, outputDType)
+	if err != nil {
+		return nil, errors.Wrap(err, "ArgMinMax")
+	}
+	id, err := f.builder.tape.AddArgMinMax(node.id, axis, isMin, dtypeToBridgeDType(outputDType))
+	if err != nil {
+		return nil, errors.Wrap(err, "ArgMinMax")
+	}
+	return &graphNode{id: id, shape: outShape, owner: f}, nil
+}
+
+// CumSum returns the cumulative sum of elements along axis.
+func (f *Function) CumSum(operand compute.Value, axis int, options compute.CumSumOptions) (compute.Value, error) {
+	node, err := f.resolveNode(operand)
+	if err != nil {
+		return nil, errors.Wrap(err, "CumSum")
+	}
+	if axis < 0 {
+		axis += node.shape.Rank()
+	}
+	outShape, err := shapeinference.CumSum(node.shape, axis)
+	if err != nil {
+		return nil, errors.Wrap(err, "CumSum")
+	}
+	id, err := f.builder.tape.AddCumulative(mlxbridge.CumulativeSum, node.id, axis, options.Reverse, options.Exclusive)
+	if err != nil {
+		return nil, errors.Wrap(err, "CumSum")
+	}
+	return &graphNode{id: id, shape: outShape, owner: f}, nil
+}
+
+// CumMax returns the cumulative maximum of elements along axis.
+func (f *Function) CumMax(operand compute.Value, axis int, options compute.CumSumOptions) (compute.Value, error) {
+	node, err := f.resolveNode(operand)
+	if err != nil {
+		return nil, errors.Wrap(err, "CumMax")
+	}
+	if axis < 0 {
+		axis += node.shape.Rank()
+	}
+	outShape, err := shapeinference.CumMax(node.shape, axis)
+	if err != nil {
+		return nil, errors.Wrap(err, "CumMax")
+	}
+	id, err := f.builder.tape.AddCumulative(mlxbridge.CumulativeMax, node.id, axis, options.Reverse, options.Exclusive)
+	if err != nil {
+		return nil, errors.Wrap(err, "CumMax")
+	}
+	return &graphNode{id: id, shape: outShape, owner: f}, nil
 }

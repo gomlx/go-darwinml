@@ -91,6 +91,35 @@ var baseCapabilities = compute.Capabilities{
 		compute.OpTypeLessOrEqualTotalOrder:   true,
 		compute.OpTypeGreaterThanTotalOrder:   true,
 		compute.OpTypeGreaterOrEqualTotalOrder: true,
+
+		// Shape manipulation operations
+		compute.OpTypeReshape:        true,
+		compute.OpTypeTranspose:      true,
+		compute.OpTypeBroadcastInDim: true,
+		compute.OpTypeSlice:          true,
+		compute.OpTypeConcatenate:    true,
+		compute.OpTypeReverse:        true,
+		compute.OpTypePad:            true,
+
+		// Selection operations
+		compute.OpTypeWhere: true,
+		compute.OpTypeClamp: true,
+
+		// Reductions, ArgMinMax, Cumulative, and DotGeneral
+		compute.OpTypeReduceSum:        true,
+		compute.OpTypeReduceProduct:    true,
+		compute.OpTypeReduceMax:        true,
+		compute.OpTypeReduceMin:        true,
+		compute.OpTypeReduceLogicalAnd: true,
+		compute.OpTypeReduceLogicalOr:  true,
+		compute.OpTypeReduceLogicalXor: true,
+		compute.OpTypeReduceBitwiseAnd: true,
+		compute.OpTypeReduceBitwiseOr:  true,
+		compute.OpTypeReduceBitwiseXor: true,
+		compute.OpTypeArgMinMax:        true,
+		compute.OpTypeCumSum:           true,
+		compute.OpTypeCumMax:           true,
+		compute.OpTypeDotGeneral:       true,
 	},
 
 	DTypes: map[dtypes.DType]bool{

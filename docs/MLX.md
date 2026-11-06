@@ -185,6 +185,15 @@ Every compiled `Executable` in `./compute/mlx` is represented as a **single flat
   - Implemented in the C++ tape replay using standard SWAR bitwise operations (`right_shift`, `bitwise_and`, `subtract`, `add`, `where`) on unsigned views of the integer tensor, which `mlx::core::compile` fuses into a single register-only Metal kernel.
 - **`Bitcast` (`OpTypeBitcast`)**:
   - Uses `mlx::core::view(a, target_dtype)` followed by `mlx::core::reshape` to match GoMLX's trailing-axis expansion/contraction semantics when bit-widths differ.
+- **Reductions (`ReduceSum`, `ReduceProduct`, `ReduceLogicalXor`, `ReduceBitwise*`)**:
+  - `mlx::core::sum` and `mlx::core::prod` promote small integer/boolean dtypes (`int8`, `int16`, `uint8`, `uint16`, `bool`) to 32-bit integers (`int32`/`uint32`); the C++ bridge casts back to the operand's original dtype via `astype` to preserve GoMLX reduction semantics.
+  - `ReduceLogicalXor` is implemented by summing `astype(a, int32)` over the reduction axes and checking parity (`(sum & 1) != 0`).
+  - Because MLX does not expose native axis-wise bitwise reductions in `<mlx/ops.h>`, `ReduceBitwiseAnd`, `ReduceBitwiseOr`, and `ReduceBitwiseXor` are implemented in `evalBitwiseReduce` using an $O(\log N)$ vectorized slice-pair tree reduction along each reduction axis followed by `squeeze`.
+- **`Pad` (`OpTypePad`)**:
+  - Supports positive edge padding (`mlx::core::pad`), negative edge padding (cropping via `mlx::core::slice`), and interior padding (decomposed into `[N] -> [N, 1]` reshape, edge pad by `Interior`, flatten to `[N*(Interior+1)]`, and slice to `[N + (N-1)*Interior]`).
+- **`DotGeneral` (`OpTypeDotGeneral`)**:
+  - Normalizes arbitrary batch, cross, and contracting axes into rank-3 `[B, M, K] @ [B, K, N]` (with a fast path for standard 2D `[M, K] @ [K, N]` matmul).
+  - Supports `Float16`, `BFloat16`, and `Float32` via hardware `mlx::core::matmul`, `Complex64` via 4-real-matmul Gauss/standard decomposition (`(ac - bd) + (ad + bc)i`), and integer types via exact broadcast multiply + sum reduction. Also honors `DotGeneralConfig.AccumulatorDType` and `DotGeneralConfig.OutputDType`.
 - **Graph Constants (`OpTypeConstant`)**:
   - When `Function.Constant(flat, dims...)` is called during graph building, the constant is immediately materialized once as an `mlx::core::array` owned by the `MLXTape` (zero per-execution allocation or copy overhead) and freed when the `Executable` / `Builder` is finalized.
 - **`ScatterSum`, `ScatterMax`, `ScatterMin`**:
