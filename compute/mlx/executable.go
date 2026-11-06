@@ -77,6 +77,7 @@ func (e *Executable) Execute(inputs []compute.Buffer, donate []bool, defaultDevi
 	inHandles := make([]mlxbridge.ArrayHandle, len(inputs))
 	donateFlags := make([]bool, len(inputs))
 
+	var boundAxes map[string]int
 	for i, in := range inputs {
 		buf, ok := in.(*Buffer)
 		if !ok || buf == nil {
@@ -86,9 +87,27 @@ func (e *Executable) Execute(inputs []compute.Buffer, donate []bool, defaultDevi
 		if err != nil {
 			return nil, errors.Wrapf(err, "Execute: input #%d", i)
 		}
-		if !e.backend.dynamicShapes && !bufShape.Equal(e.inputShapes[i]) {
+		expected := e.inputShapes[i]
+		if bufShape.DType != expected.DType || bufShape.Rank() != expected.Rank() {
 			return nil, errors.Errorf("Execute: input #%d shape mismatch: expected %s, got %s",
-				i, e.inputShapes[i], bufShape)
+				i, expected, bufShape)
+		}
+		for ax, expDim := range expected.Dimensions {
+			gotDim := bufShape.Dimensions[ax]
+			if expDim != shapes.DynamicDim && gotDim != expDim {
+				return nil, errors.Errorf("Execute: input #%d dimension %d mismatch: expected %s, got %s",
+					i, ax, expected, bufShape)
+			}
+			if name := expected.AxisName(ax); name != "" && name != shapes.AnonymousAxis {
+				if boundAxes == nil {
+					boundAxes = make(map[string]int)
+				}
+				if prev, exists := boundAxes[name]; exists && prev != gotDim {
+					return nil, errors.Errorf("Execute: input #%d dynamic axis %q mismatch: previously bound to %d, got %d",
+						i, name, prev, gotDim)
+				}
+				boundAxes[name] = gotDim
+			}
 		}
 		inBuffers[i] = buf
 		if i < len(donate) && donate[i] {
