@@ -1,0 +1,372 @@
+// Copyright 2023-2026 The GoMLX Authors. SPDX-License-Identifier: Apache-2.0
+
+//go:build darwin && cgo
+
+// Package mlxbridge provides CGo bindings to Apple's MLX C++ framework for GPU-accelerated
+// tensor computation on Apple Silicon.
+package mlxbridge
+
+/*
+#cgo darwin CXXFLAGS: -std=c++20 -I/opt/homebrew/include -I/usr/local/include
+#cgo darwin LDFLAGS: -Wl,-undefined,dynamic_lookup -Wl,-rpath,/opt/homebrew/lib -Wl,-rpath,/usr/local/lib
+#include "bridge.h"
+#include <stdlib.h>
+*/
+import "C"
+
+import (
+	"fmt"
+	"runtime"
+	"unsafe"
+)
+
+// DType mirrors the MLXDType enum in bridge.h.
+type DType = int
+
+const (
+	DTypeBool      DType = C.MLX_DTYPE_BOOL
+	DTypeInt8      DType = C.MLX_DTYPE_INT8
+	DTypeInt16     DType = C.MLX_DTYPE_INT16
+	DTypeInt32     DType = C.MLX_DTYPE_INT32
+	DTypeInt64     DType = C.MLX_DTYPE_INT64
+	DTypeFloat16   DType = C.MLX_DTYPE_FLOAT16
+	DTypeBF16      DType = C.MLX_DTYPE_BFLOAT16
+	DTypeFloat32   DType = C.MLX_DTYPE_FLOAT32
+	DTypeFloat64   DType = C.MLX_DTYPE_FLOAT64
+	DTypeUint8     DType = C.MLX_DTYPE_UINT8
+	DTypeUint16    DType = C.MLX_DTYPE_UINT16
+	DTypeUint32    DType = C.MLX_DTYPE_UINT32
+	DTypeUint64    DType = C.MLX_DTYPE_UINT64
+	DTypeComplex64 DType = C.MLX_DTYPE_COMPLEX64
+)
+
+// ArrayHandle is an opaque uintptr handle to a C++ mlx::core::array*.
+type ArrayHandle uintptr
+
+// NodeID identifies a recorded node in an MLXTape.
+type NodeID = int32
+
+// Tape wraps an MLXTapeHandle recording graph operations.
+type Tape struct {
+	handle  C.MLXTapeHandle
+	cleanup runtime.Cleanup
+}
+
+// Exec wraps a compiled or replayable MLXExecHandle.
+type Exec struct {
+	handle  C.MLXExecHandle
+	cleanup runtime.Cleanup
+}
+
+// extractError converts an MLXError into a Go error and frees any C message.
+func extractError(err C.MLXError) error {
+	if err.code == 0 {
+		return nil
+	}
+	msg := "unknown error"
+	if err.message != nil {
+		msg = C.GoString(err.message)
+		C.free(unsafe.Pointer(err.message))
+	}
+	return fmt.Errorf("mlx: %s", msg)
+}
+
+// Init initializes the MLX bridge and verifies that MLX and its Metal GPU backend are available.
+func Init() error {
+	var cErr C.MLXError
+	if !C.mlx_bridge_init(&cErr) {
+		return extractError(cErr)
+	}
+	return nil
+}
+
+// DeviceName returns the Apple Silicon GPU device name reported by MLX.
+func DeviceName() (string, error) {
+	var cErr C.MLXError
+	cName := C.mlx_device_name(&cErr)
+	if err := extractError(cErr); err != nil {
+		return "", err
+	}
+	if cName == nil {
+		return "Apple Silicon GPU", nil
+	}
+	name := C.GoString(cName)
+	C.free(unsafe.Pointer(cName))
+	return name, nil
+}
+
+// Version returns the installed MLX version string.
+func Version() (string, error) {
+	var cErr C.MLXError
+	cVer := C.mlx_version_string(&cErr)
+	if err := extractError(cErr); err != nil {
+		return "", err
+	}
+	if cVer == nil {
+		return "", nil
+	}
+	ver := C.GoString(cVer)
+	C.free(unsafe.Pointer(cVer))
+	return ver, nil
+}
+
+// ===========================================================================
+// Array / Buffer Management
+// ===========================================================================
+
+func toInt32Shape(shape []int) (*C.int32_t, C.int, []C.int32_t) {
+	if len(shape) == 0 {
+		return nil, 0, nil
+	}
+	cShape := make([]C.int32_t, len(shape))
+	for i, d := range shape {
+		cShape[i] = C.int32_t(d)
+	}
+	return &cShape[0], C.int(len(shape)), cShape
+}
+
+// NewArray allocates an uninitialized unified-memory MLX array of the given shape and dtype.
+func NewArray(nbytes int64, dtype DType, shape []int) (ArrayHandle, error) {
+	var cErr C.MLXError
+	shapePtr, rank, cShape := toInt32Shape(shape)
+	h := C.mlx_array_create(C.int64_t(nbytes), C.int(dtype), shapePtr, rank, &cErr)
+	runtime.KeepAlive(cShape)
+	if err := extractError(cErr); err != nil {
+		return 0, err
+	}
+	return ArrayHandle(uintptr(h)), nil
+}
+
+// NewArrayFromData creates an MLX array initialized with a copy of data in unified memory.
+func NewArrayFromData(data unsafe.Pointer, nbytes int64, dtype DType, shape []int) (ArrayHandle, error) {
+	var cErr C.MLXError
+	shapePtr, rank, cShape := toInt32Shape(shape)
+	h := C.mlx_array_from_data(data, C.int64_t(nbytes), C.int(dtype), shapePtr, rank, &cErr)
+	runtime.KeepAlive(cShape)
+	if err := extractError(cErr); err != nil {
+		return 0, err
+	}
+	return ArrayHandle(uintptr(h)), nil
+}
+
+// ArrayDataPtr returns the shared CPU/GPU unified memory pointer for an evaluated array.
+func ArrayDataPtr(arr ArrayHandle) unsafe.Pointer {
+	if arr == 0 {
+		return nil
+	}
+	return C.mlx_array_data_ptr(C.MLXArrayHandle(unsafe.Pointer(arr)))
+}
+
+// ArrayNBytes returns the byte size of the array.
+func ArrayNBytes(arr ArrayHandle) int64 {
+	if arr == 0 {
+		return 0
+	}
+	return int64(C.mlx_array_nbytes(C.MLXArrayHandle(unsafe.Pointer(arr))))
+}
+
+// ArrayDType returns the bridge DType of the array.
+func ArrayDType(arr ArrayHandle) DType {
+	if arr == 0 {
+		return DTypeFloat32
+	}
+	return DType(C.mlx_array_dtype(C.MLXArrayHandle(unsafe.Pointer(arr))))
+}
+
+// ArrayShape returns the runtime dimensions of the array.
+func ArrayShape(arr ArrayHandle) []int {
+	if arr == 0 {
+		return nil
+	}
+	h := C.MLXArrayHandle(unsafe.Pointer(arr))
+	ndim := int(C.mlx_array_ndim(h))
+	if ndim == 0 {
+		return nil
+	}
+	cShape := make([]C.int32_t, ndim)
+	C.mlx_array_shape(h, &cShape[0])
+	dims := make([]int, ndim)
+	for i, d := range cShape {
+		dims[i] = int(d)
+	}
+	return dims
+}
+
+// ArrayIsRowContiguous reports whether the array is row-contiguous and its buffer matches its logical element count.
+func ArrayIsRowContiguous(arr ArrayHandle) bool {
+	if arr == 0 {
+		return false
+	}
+	return bool(C.mlx_array_is_row_contiguous(C.MLXArrayHandle(unsafe.Pointer(arr))))
+}
+
+// ArrayEnsureContiguous evaluates and materializes a row-contiguous buffer in-place if the array is a strided/broadcast view.
+func ArrayEnsureContiguous(arr ArrayHandle) error {
+	if arr == 0 {
+		return fmt.Errorf("mlx: nil array handle")
+	}
+	var cErr C.MLXError
+	if !C.mlx_array_ensure_contiguous(C.MLXArrayHandle(unsafe.Pointer(arr)), &cErr) {
+		return extractError(cErr)
+	}
+	return nil
+}
+
+// DestroyArray frees the C++ mlx::core::array* handle.
+func DestroyArray(arr ArrayHandle) {
+	if arr != 0 {
+		C.mlx_array_destroy(C.MLXArrayHandle(unsafe.Pointer(arr)))
+	}
+}
+
+// ===========================================================================
+// Tape & Execution
+// ===========================================================================
+
+// NewTape creates a new MLXTape for recording graph operations.
+func NewTape() (*Tape, error) {
+	var cErr C.MLXError
+	h := C.mlx_tape_create(&cErr)
+	if err := extractError(cErr); err != nil {
+		return nil, err
+	}
+	t := &Tape{handle: h}
+	t.cleanup = runtime.AddCleanup(t, func(handle C.MLXTapeHandle) {
+		if handle != nil {
+			C.mlx_tape_destroy(handle)
+		}
+	}, h)
+	return t, nil
+}
+
+// Destroy releases the tape.
+func (t *Tape) Destroy() {
+	if t != nil && t.handle != nil {
+		t.cleanup.Stop()
+		C.mlx_tape_destroy(t.handle)
+		t.handle = nil
+	}
+}
+
+// AddParameter records an input parameter node in the tape.
+func (t *Tape) AddParameter(dtype DType, shape []int) (NodeID, error) {
+	var cErr C.MLXError
+	shapePtr, rank, cShape := toInt32Shape(shape)
+	id := C.mlx_tape_add_parameter(t.handle, C.int(dtype), shapePtr, rank, &cErr)
+	runtime.KeepAlive(cShape)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// AddConstant materializes a constant array in the tape.
+func (t *Tape) AddConstant(data unsafe.Pointer, nbytes int64, dtype DType, shape []int) (NodeID, error) {
+	var cErr C.MLXError
+	shapePtr, rank, cShape := toInt32Shape(shape)
+	id := C.mlx_tape_add_constant(t.handle, data, C.int64_t(nbytes), C.int(dtype), shapePtr, rank, &cErr)
+	runtime.KeepAlive(cShape)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
+// Compile compiles the tape into an Exec.
+func (t *Tape) Compile(outputIDs []NodeID, compileGraph, eagerContiguous bool) (*Exec, error) {
+	var cErr C.MLXError
+	var outPtr *C.int32_t
+	cOuts := make([]C.int32_t, len(outputIDs))
+	for i, id := range outputIDs {
+		cOuts[i] = C.int32_t(id)
+	}
+	if len(cOuts) > 0 {
+		outPtr = &cOuts[0]
+	}
+	h := C.mlx_tape_compile(
+		t.handle,
+		outPtr,
+		C.int(len(cOuts)),
+		C.bool(compileGraph),
+		C.bool(eagerContiguous),
+		&cErr,
+	)
+	runtime.KeepAlive(cOuts)
+	if err := extractError(cErr); err != nil {
+		return nil, err
+	}
+	e := &Exec{handle: h}
+	e.cleanup = runtime.AddCleanup(e, func(handle C.MLXExecHandle) {
+		if handle != nil {
+			C.mlx_exec_destroy(handle)
+		}
+	}, h)
+	return e, nil
+}
+
+// Destroy releases the compiled executable.
+func (e *Exec) Destroy() {
+	if e != nil && e.handle != nil {
+		e.cleanup.Stop()
+		C.mlx_exec_destroy(e.handle)
+		e.handle = nil
+	}
+}
+
+// Execute runs the executable on the given input array handles.
+// For any input i where donate[i] is true, the caller must have detached the ArrayHandle
+// from its Go Buffer before calling Execute, as Execute will delete the C++ handle
+// before mlx::core::eval() runs.
+func (e *Exec) Execute(inputs []ArrayHandle, donate []bool, numOutputs int) ([]ArrayHandle, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	var cErr C.MLXError
+	numInputs := len(inputs)
+
+	cInputs := make([]C.MLXArrayHandle, numInputs)
+	cDonate := make([]C.bool, numInputs)
+	for i, in := range inputs {
+		cInputs[i] = C.MLXArrayHandle(unsafe.Pointer(in))
+		if i < len(donate) && donate[i] {
+			cDonate[i] = C.bool(true)
+		}
+	}
+
+	cOutputs := make([]C.MLXArrayHandle, numOutputs)
+
+	var inPtr *C.MLXArrayHandle
+	var donatePtr *C.bool
+	if numInputs > 0 {
+		inPtr = &cInputs[0]
+		donatePtr = &cDonate[0]
+	}
+	var outPtr *C.MLXArrayHandle
+	if numOutputs > 0 {
+		outPtr = &cOutputs[0]
+	}
+
+	ok := C.mlx_exec_execute(
+		e.handle,
+		inPtr,
+		donatePtr,
+		C.int(numInputs),
+		outPtr,
+		C.int(numOutputs),
+		&cErr,
+	)
+	runtime.KeepAlive(cInputs)
+	runtime.KeepAlive(cDonate)
+	if !ok {
+		if err := extractError(cErr); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("mlx: execution failed")
+	}
+
+	outputs := make([]ArrayHandle, numOutputs)
+	for i, h := range cOutputs {
+		outputs[i] = ArrayHandle(uintptr(h))
+	}
+	return outputs, nil
+}
