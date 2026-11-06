@@ -172,6 +172,19 @@ Every compiled `Executable` in `./compute/mlx` is represented as a **single flat
 - **`Sort` (`OpTypeSort`) with non-standard comparator**: Only standard ascending (`<`, `<=`) and descending (`>`, `>=`) comparators on a key tensor are supported via native GPU `mlx::core::sort` / `mlx::core::argsort`. Custom comparators return `compute.ErrNotImplemented` with a message advising refactoring into a standard ascending/descending sort.
 
 ### 5.3 Operation Quirks & Semantics Notes
+- **Shape Inference & Auto-Broadcasting**:
+  - Because `MLXTape` records operations lazily without executing MLX during graph construction, all shape validation and output shape computation are performed in Go using `github.com/gomlx/compute/shapeinference` (`shapeinference.UnaryOp`, `shapeinference.BinaryOp`, `shapeinference.ComparisonOp`, `shapeinference.Where`, etc.).
+  - MLX's C++ binary, comparison, and ternary operations (`add`, `subtract`, `multiply`, `divide`, `equal`, `less`, `where`, `clip`, etc.) natively implement NumPy-style auto-broadcasting via zero-copy stride-0 views. Since NumPy broadcasting is a strict superset of GoMLX's implicit broadcasting rules (scalars broadcast to the other operand's shape; non-scalar operands have matching rank with size-1 dimensions broadcast to the larger dimension, including `shapes.DynamicDim`), **no intermediate `broadcast_to` operations need to be injected** before binary, comparison, `Where`, or `Clamp` ops.
+- **Integer `Div` and `Rem` (`OpTypeDiv`, `OpTypeRem`)**:
+  - In MLX, `mlx::core::divide(a, b)` implements Python true division (promoting integer inputs to `float32`), and `mlx::core::floor_divide(a, b)` / `mlx::core::remainder(a, b)` implement floor division toward $-\infty$ (sign matching the divisor `b`).
+  - GoMLX/XLA `Div` and `Rem` follow C/Go truncation-toward-zero semantics (`q = trunc(a / b)` and `r = a - q * b`, where the remainder sign matches the dividend `a`).
+  - For unsigned integers, `mlx::core::floor_divide` and `mlx::core::remainder` match C/Go semantics directly. For signed integers, the C++ bridge computes exact integer truncation division (`evalIntTruncDiv`) by dividing unsigned magnitudes (`mlx::core::floor_divide` on `astype(abs(a), u_dt)`) and restoring the quotient sign when `(a < 0) != (b < 0)`, preserving full precision across all integer widths (`int8` through `int64`). For floating-point `Rem`, the bridge computes `a - trunc(a / b) * b` via `where(q >= 0, floor(q), ceil(q))`.
+- **`ShiftRightLogical` vs. `ShiftRightArithmetic`**:
+  - In MLX, `mlx::core::right_shift(a, b)` performs an arithmetic right shift on signed integer types and a logical right shift on unsigned integer types. For `ShiftRightLogical` on signed integers (`Int8`, `Int16`, `Int32`, `Int64`), the bridge casts operands to the corresponding unsigned integer dtype (`uint8`, `uint16`, `uint32`, `uint64`) via `astype`, applies `right_shift`, and casts back to the signed dtype.
+- **`BitCount` (`Popcnt`) and `Clz` (Count Leading Zeros)**:
+  - Implemented in the C++ tape replay using standard SWAR bitwise operations (`right_shift`, `bitwise_and`, `subtract`, `add`, `where`) on unsigned views of the integer tensor, which `mlx::core::compile` fuses into a single register-only Metal kernel.
+- **`Bitcast` (`OpTypeBitcast`)**:
+  - Uses `mlx::core::view(a, target_dtype)` followed by `mlx::core::reshape` to match GoMLX's trailing-axis expansion/contraction semantics when bit-widths differ.
 - **Graph Constants (`OpTypeConstant`)**:
   - When `Function.Constant(flat, dims...)` is called during graph building, the constant is immediately materialized once as an `mlx::core::array` owned by the `MLXTape` (zero per-execution allocation or copy overhead) and freed when the `Executable` / `Builder` is finalized.
 - **`ScatterSum`, `ScatterMax`, `ScatterMin`**:
