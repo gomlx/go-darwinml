@@ -945,8 +945,14 @@ MPSGraphTensorHandle mpsgraph_dynamic_slice(MPSGraphContextHandle handle,
             // Cast range to match startIdx type.
             range = [ctx.graph castTensor:range toType:startIdx.dataType name:nil];
 
-            // Reshape startIdx to scalar-compatible shape for broadcasting.
+            // Reshape startIdx to scalar-compatible shape for broadcasting and clamp to [0, axisDim - length].
             startIdx = [ctx.graph reshapeTensor:startIdx withShape:@[@1] name:nil];
+            MPSGraphTensor* zero = [ctx.graph constantWithScalar:0 dataType:startIdx.dataType];
+            MPSGraphTensor* maxStart = [ctx.graph constantWithScalar:(double)(axisDim - length) dataType:startIdx.dataType];
+            startIdx = [ctx.graph clampWithTensor:startIdx
+                                   minValueTensor:zero
+                                   maxValueTensor:maxStart
+                                             name:nil];
 
             // indices = range + startIdx → [start, start+1, ..., start+length-1]
             MPSGraphTensor* indices = [ctx.graph additionWithPrimaryTensor:range
@@ -1005,6 +1011,14 @@ MPSGraphTensorHandle mpsgraph_dynamic_update_slice(MPSGraphContextHandle handle,
         for (int axis = 0; axis < numIndices; axis++) {
             MPSGraphTensor* startIdx = (__bridge MPSGraphTensor*)startIndices[axis];
             startIdx = [ctx.graph reshapeTensor:startIdx withShape:@[@1] name:nil];
+            NSUInteger inputDim = inputShape[axis].unsignedLongValue;
+            NSUInteger updateSize = update.shape[axis].unsignedLongValue;
+            MPSGraphTensor* zero = [ctx.graph constantWithScalar:0 dataType:startIdx.dataType];
+            MPSGraphTensor* maxStart = [ctx.graph constantWithScalar:(double)(inputDim - updateSize) dataType:startIdx.dataType];
+            startIdx = [ctx.graph clampWithTensor:startIdx
+                                   minValueTensor:zero
+                                   maxValueTensor:maxStart
+                                             name:nil];
 
             // range = [0, 1, ..., dim-1] along this axis, broadcast to input shape.
             MPSGraphTensor* range = [ctx.graph coordinateAlongAxis:axis
@@ -1016,7 +1030,6 @@ MPSGraphTensorHandle mpsgraph_dynamic_update_slice(MPSGraphContextHandle handle,
             MPSGraphTensor* lower = [ctx.graph greaterThanOrEqualToWithPrimaryTensor:range
                                                                     secondaryTensor:startIdx
                                                                                name:nil];
-            NSUInteger updateSize = update.shape[axis].unsignedLongValue;
             MPSGraphTensor* endIdx = [ctx.graph additionWithPrimaryTensor:startIdx
                                                          secondaryTensor:[ctx.graph constantWithScalar:updateSize
                                                                                              dataType:startIdx.dataType]
@@ -1048,6 +1061,13 @@ MPSGraphTensorHandle mpsgraph_dynamic_update_slice(MPSGraphContextHandle handle,
             NSInteger updateDim = update.shape[axis].integerValue;
 
             if (inputDim == updateDim) continue; // No expansion needed on this axis.
+
+            MPSGraphTensor* zeroStart = [ctx.graph constantWithScalar:0 dataType:startIdx.dataType];
+            MPSGraphTensor* maxStart = [ctx.graph constantWithScalar:(double)(inputDim - updateDim) dataType:startIdx.dataType];
+            startIdx = [ctx.graph clampWithTensor:startIdx
+                                   minValueTensor:zeroStart
+                                   maxValueTensor:maxStart
+                                             name:nil];
 
             // Create range [0, ..., inputDim-1].
             NSMutableArray<NSNumber*>* rangeShape = [NSMutableArray arrayWithObject:@(inputDim)];

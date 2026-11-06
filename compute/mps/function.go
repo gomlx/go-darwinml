@@ -193,6 +193,9 @@ func (f *Function) resolveNode(v compute.Value) (*graphNode, error) {
 	if !ok {
 		return nil, errors.Errorf("expected *graphNode, got %T", v)
 	}
+	if node.tensor == nil {
+		return nil, errors.Wrap(compute.ErrNotImplemented, "mps: operations on control-flow outputs or zero-sized tensors are not supported")
+	}
 	// Fast path: no closure context or same owner — no capture needed.
 	if f.ownCtx == nil || node.owner == nil || node.owner == f {
 		return node, nil
@@ -359,9 +362,20 @@ func (f *Function) Constant(flat any, dims ...int) (compute.Value, error) {
 
 // Return marks the function outputs.
 func (f *Function) Return(outputs []compute.Value, shardings []*compute.ShardingSpec) error {
-	nodes, err := f.resolveNodes("Return", outputs...)
-	if err != nil {
-		return err
+	nodes := make([]*graphNode, len(outputs))
+	for i, v := range outputs {
+		node, ok := v.(*graphNode)
+		if !ok {
+			return errors.Errorf("Return: input #%d: expected *graphNode, got %T", i, v)
+		}
+		if node.tensor != nil {
+			var err error
+			node, err = f.resolveNode(v)
+			if err != nil {
+				return errors.Wrapf(err, "Return: input #%d", i)
+			}
+		}
+		nodes[i] = node
 	}
 	f.outputs = nodes
 	f.returned = true
@@ -370,6 +384,9 @@ func (f *Function) Return(outputs []compute.Value, shardings []*compute.Sharding
 
 // Call calls another function with the given inputs.
 func (f *Function) Call(fn compute.Function, inputs ...compute.Value) ([]compute.Value, error) {
+	if f.controlFlowStep != nil {
+		return nil, errors.Wrap(compute.ErrNotImplemented, "Call: only one control flow operation per function is supported")
+	}
 	inputNodes, err := f.resolveNodes("Call", inputs...)
 	if err != nil {
 		return nil, err
@@ -1707,24 +1724,50 @@ func (f *Function) Pad(operand, fillValue compute.Value, axesConfig ...compute.P
 // DynamicSlice
 // ===========================================================================
 
+func (f *Function) normalizeDynamicStartIndices(opName string, rank int, startIndicesValues []compute.Value) ([]bridge.Tensor, error) {
+	startNodes := make([]*graphNode, len(startIndicesValues))
+	for i, v := range startIndicesValues {
+		n, err := f.resolveNode(v)
+		if err != nil {
+			return nil, errors.Wrapf(err, "%s: startIndex[%d]", opName, i)
+		}
+		startNodes[i] = n
+	}
+	if len(startNodes) == 1 && rank > 1 && startNodes[0].shape.Rank() == 1 && startNodes[0].shape.Dimensions[0] == rank {
+		vec := startNodes[0].tensor
+		tensors := make([]bridge.Tensor, rank)
+		for i := range rank {
+			s, err := f.ctx().Slice(vec, []int64{int64(i)}, []int64{int64(i + 1)}, []int64{1})
+			if err != nil {
+				return nil, errors.Wrapf(err, "%s: slice startIndices[%d]", opName, i)
+			}
+			tensors[i] = s
+		}
+		return tensors, nil
+	}
+	tensors := make([]bridge.Tensor, len(startNodes))
+	for i, n := range startNodes {
+		tensors[i] = n.tensor
+	}
+	return tensors, nil
+}
+
 func (f *Function) DynamicSlice(operand compute.Value, startIndicesValues []compute.Value, sliceSizes []int) (compute.Value, error) {
 	opNode, err := f.resolveNode(operand)
 	if err != nil {
 		return nil, errors.Wrap(err, "DynamicSlice: operand")
 	}
 
-	startIndicesTensors := make([]bridge.Tensor, len(startIndicesValues))
-	for i, v := range startIndicesValues {
-		n, err := f.resolveNode(v)
-		if err != nil {
-			return nil, errors.Wrapf(err, "DynamicSlice: startIndex[%d]", i)
-		}
-		startIndicesTensors[i] = n.tensor
+	startIndicesTensors, err := f.normalizeDynamicStartIndices("DynamicSlice", opNode.shape.Rank(), startIndicesValues)
+	if err != nil {
+		return nil, err
+	}
+	outShape, err := shapeinference.DynamicSlice(opNode.shape, sliceSizes)
+	if err != nil {
+		return nil, errors.Wrap(err, "DynamicSlice")
 	}
 
 	sliceSizes64 := toInt64Slice(sliceSizes)
-
-	outShape := shapes.Make(opNode.shape.DType, sliceSizes...)
 	tensor, err := f.ctx().DynamicSlice(opNode.tensor, startIndicesTensors, sliceSizes64)
 	if err != nil {
 		return nil, errors.Wrap(err, "DynamicSlice")
@@ -1742,21 +1785,20 @@ func (f *Function) DynamicUpdateSlice(operand, update compute.Value, startIndice
 		return nil, errors.Wrap(err, "DynamicUpdateSlice: update")
 	}
 
-	startIndicesTensors := make([]bridge.Tensor, len(startIndicesValues))
-	for i, v := range startIndicesValues {
-		n, err := f.resolveNode(v)
-		if err != nil {
-			return nil, errors.Wrapf(err, "DynamicUpdateSlice: startIndex[%d]", i)
-		}
-		startIndicesTensors[i] = n.tensor
+	startIndicesTensors, err := f.normalizeDynamicStartIndices("DynamicUpdateSlice", opNode.shape.Rank(), startIndicesValues)
+	if err != nil {
+		return nil, err
+	}
+	outShape, err := shapeinference.DynamicUpdateSlice(opNode.shape, updNode.shape)
+	if err != nil {
+		return nil, errors.Wrap(err, "DynamicUpdateSlice")
 	}
 
 	tensor, err := f.ctx().DynamicUpdateSlice(opNode.tensor, updNode.tensor, startIndicesTensors)
 	if err != nil {
 		return nil, errors.Wrap(err, "DynamicUpdateSlice")
 	}
-	// Output shape is same as operand shape.
-	return &graphNode{tensor: tensor, shape: opNode.shape, owner: f}, nil
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
 // ===========================================================================
