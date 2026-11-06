@@ -3,10 +3,17 @@
 ## Overview
 `github.com/gomlx/go-darwinml` provides Apple Silicon hardware acceleration backends for GoMLX (`github.com/gomlx/compute`).
 
-Currently implemented backend:
+Currently implemented backends:
 - **`mps`** (`./compute/mps`): Apple Metal Performance Shaders Graph (`MPSGraph`) GPU backend.
+- **`mlx`** (`./compute/mlx`): Apple [MLX](https://github.com/ml-explore/mlx) (`mlx::core`) GPU backend (supports both `"mlx"` compiled static execution and `"mlx:dynamic"` native dynamic-shape execution).
 
 ## Repository Layout
+- `./compute/mlx/`: Implementation of `compute.Backend`, `compute.Builder`, `compute.Function`, `compute.Executable`, and `compute.Buffer` for the `"mlx"` backend (see [`docs/MLX.md`](../docs/MLX.md)).
+  - `register_darwin.go` / `nocgo_darwin.go` / `stub_other.go`: Platform build tags and registration (`compute.Register("mlx", New)`).
+  - `backend.go`, `buffer.go`, `builder.go`, `executable.go`: Backend lifecycle, zero-copy unified-memory `mlx::core::array` buffers with `runtime.AddCleanup` and pre-`eval` buffer donation, and compiled (`"mlx"`) vs. dynamic (`"mlx:dynamic"`) execution.
+  - `function.go`, `dotgeneral.go`, `gather.go`, `conv_pool_norm.go`, `fused.go`, `capabilities.go`: Tape graph construction for standard, dynamic-shape, sub-function (`Call`), pattern-matched `Sort`, and fused operations.
+  - `mlx_test.go`: Unit tests and full `backendtest.RunAll` compliance suite (`TestCompliance`) across `"mlx"`, `"mlx:dynamic"`, and `"mlx:dynamic,lazy_contiguous"`.
+- `./internal/mlxbridge/`: CGo + C++17 bridge wrapping Apple's `<mlx/mlx.h>` (`bridge.h`, `bridge.cpp`, `bridge.go`, `bridge_nocgo.go`), with runtime `dlopen` check for `libmlx.dylib`.
 - `./compute/mps/`: Implementation of `compute.Backend`, `compute.Builder`, `compute.Function`, `compute.Executable`, and `compute.Buffer` for the `"mps"` backend.
   - `register_darwin.go` / `nocgo_darwin.go` / `stub_other.go`: Platform build tags (`darwin && cgo`, `darwin && !cgo`, `!darwin`) and registration (`backends.Register("mps", New)`).
   - `backend.go`: `Backend` struct and lifecycle (`New`, `Finalize`, `Capabilities`).

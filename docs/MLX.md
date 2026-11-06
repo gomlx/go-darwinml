@@ -1,6 +1,6 @@
-# MLX Backend (`"mlx"`) Design Plan
+# MLX Backend (`"mlx"`) Architecture & Implementation
 
-This document tracks the architecture and implementation plan for the `"mlx"` backend (`github.com/gomlx/go-darwinml/compute/mlx`), which accelerates GoMLX (`github.com/gomlx/compute`) on Apple Silicon using Apple's [MLX](https://github.com/ml-explore/mlx) framework.
+This document describes the architecture and implementation details of the `"mlx"` backend (`github.com/gomlx/go-darwinml/compute/mlx`), which accelerates GoMLX (`github.com/gomlx/compute`) on Apple Silicon using Apple's [MLX](https://github.com/ml-explore/mlx) framework.
 
 ---
 
@@ -12,22 +12,22 @@ Unlike PyTorch (eager) or `MPSGraph` (explicit static `MPSGraph*` object), MLX u
 - Calling `mlx::core::eval(outputs)` traverses the lazy DAG of `mlx::core::array` nodes, schedules Metal kernels on the GPU stream, materializes the output buffers in Apple Silicon Unified Memory, and **detaches the graph history** from the evaluated arrays so intermediate buffers can be freed.
 - Because `mlx::core::eval` consumes/detaches the DAG links on the `array` instances, `Builder` / `Function` records operations into an **Op Tape** (a linear list of instructions in topological order).
 
-### 1.2 Dual Execution Modes (Agreed Decision)
-Both `compute.Backend` and GoMLX support input-conditioned dynamic shapes (dynamic dimensions with fixed rank, advertised via `Capabilities.DynamicShapes` and `DynamicOps`).
+### 1.2 Dual Execution Modes
+Both `compute.Backend` and GoMLX support input-conditioned dynamic shapes (dynamic dimensions with fixed rank, advertised via `Capabilities.DynamicShapes` and `DynamicAxes`).
 
-We will support **both** execution modes over the same recorded Op Tape, controlled by the backend configuration string:
+The `"mlx"` backend supports **both** execution modes over the same recorded Op Tape, controlled by the backend configuration string:
 
 1. **Default Mode (`"mlx"`) — Compiled Static Execution**:
    - **Capabilities**: `DynamicShapes: compute.DynamicShapesNone`.
-   - **Compilation (`Builder.Compile()`)**: Wraps the recorded Op Tape in `mlx::core::compile(tape_fn, /*shapeless=*/false)` and traces it at `Compile()` time using the static parameter shapes (`Parameter(name, shape)`). MLX optimizes the graph and fuses chains of elementwise/reduction operations into single Metal shaders.
+   - **Compilation (`Builder.Compile()`)**: Prunes unreachable tape nodes (`computeReachable`), wraps the recorded Op Tape in `mlx::core::compile(tape_fn, /*shapeless=*/false)`, and traces it on first execution. MLX optimizes the graph and fuses chains of elementwise/reduction operations into single Metal shaders.
    - **Execution (`Executable.Execute()`)**: Invokes the compiled function on the input `mlx::core::array`s and calls `mlx::core::eval(outputs)`.
    - **Trade-off**: Fastest execution (full kernel fusion); requires static shapes per `Executable` (GoMLX recompiles a new `Executable` if input shapes change).
 
 2. **Dynamic Mode (`"mlx:dynamic"`) — Lazy Tape Replay with Dynamic Shapes**:
-   - **Capabilities**: `DynamicShapes: compute.DynamicShapesNative` (and `DynamicAxes: true`), supporting `compute.DynamicOps` (`DynamicDimensionSize`, `DynamicReshape`, `DynamicBroadcastInDim`, `DynamicIota`, `DynamicPad`).
-   - **Compilation (`Builder.Compile()`)**: Keeps the recorded Op Tape without static compilation.
+   - **Capabilities**: `DynamicShapes: compute.DynamicShapesNative` (and `DynamicAxes: true`).
+   - **Compilation (`Builder.Compile()`)**: Prunes unreachable tape nodes and retains the recorded Op Tape without static compilation.
    - **Execution (`Executable.Execute()`)**: Replays the Op Tape lazily on the concrete runtime input `mlx::core::array`s and calls `mlx::core::eval(outputs)`.
-     - Because every `mlx::core::array` carries its concrete runtime dimensions during tape replay, `DynamicOps` (such as `DynamicDimensionSize`, `DynamicReshape`, `DynamicBroadcastInDim`, `DynamicIota`, `DynamicPad`) resolve concrete dimensions directly at replay time with zero recompilation overhead.
+     - Because every `mlx::core::array` carries its concrete runtime dimensions during tape replay, operations with `shapes.DynamicDim` (such as `BroadcastInDim`, `Reshape`, `DotGeneral`, `FusedAttentionQKVProjection`, and `FusedScaledDotProductAttention`) encode negative dynamic dimension references (`-(2 + nodeID*16 + axis)`) and resolve concrete runtime dimensions directly at replay time with zero recompilation overhead.
    - **Trade-off**: Zero recompilation across variable input dimensions (e.g. variable batch sizes or sequence lengths), at the cost of skipping `mlx::core::compile` elementwise fusion.
 
 ---
@@ -49,12 +49,8 @@ We will support **both** execution modes over the same recorded Op Tape, control
   - `internal/bridge` links only system frameworks (`Metal`, `MPSGraph`). Keeping `internal/mlxbridge` separate ensures users of `compute/mps` do not need `libmlx` installed.
 - **Shared Slice Helpers in `github.com/gomlx/compute/dtypes`**:
   - Zero-copy unified-memory slice & flat data helpers (`UnsafeAnySliceFromBytes`, `MakeAnySlice`, `FromAnySlice`, `CheckAnySlice`, `SafeCopyAnySlice`) are shared directly via `github.com/gomlx/compute/dtypes`.
-- **Shared Pure-Go Package (`./internal/common`)**:
-  - `DotGeneral` axis classification & rank-3 normalization helpers (`DotGeneralOutputShape`, `IsSimpleMatMul`, `ClassifyAxes`, `IsIdentityPerm`).
-  - Layout permutation helpers for `ConvGeneral` and padding helpers for `ReduceWindow`.
-  - XLA-compliant Philox 4x32-10 `RNGBitGenerator` graph builder parameterized over a minimal 8-op interface so both `"mps"` and `"mlx"` share the exact same implementation.
 - **Native MLX Operations in `./compute/mlx`**:
-  - `./compute/mlx` implements its own `Function` layer so it can directly use MLX's native operations (`mlx::core::gather`, `mlx::core::scatter`, `mlx::core::conv_general`, `mlx::fast::scaled_dot_product_attention`, `mlx::fast::layer_norm`, `mlx::fast::rms_norm`, `Complex64`, and `compute.DynamicOps`) without `MPSGraph`-specific workarounds.
+  - `./compute/mlx` implements its own `Function` layer so it can directly use MLX's native operations (`mlx::core::gather`, `mlx::core::scatter_*`, `mlx::core::conv_general`, `mlx::core::as_strided`, `mlx::core::fast::layer_norm`, `Complex64`, and native dynamic shape resolution) without `MPSGraph`-specific workarounds.
 
 ---
 
@@ -159,8 +155,6 @@ Every compiled `Executable` in `./compute/mlx` is represented as a **single flat
 
 ## 5. Operations And DTypes
 
-*(Living section — populated as operations are implemented and tested)*
-
 ### 5.1 Data Types (`dtypes.DType`)
 - **Supported**: `Bool`, `Int8`, `Int16`, `Int32`, `Int64`, `Uint8`, `Uint16`, `Uint32`, `Uint64`, `Float16`, `BFloat16`, `Float32`, `Complex64`.
 - **Unsupported on Metal GPU (`compute.ErrNotImplemented`)**:
@@ -170,6 +164,8 @@ Every compiled `Executable` in `./compute/mlx` is represented as a **single flat
 ### 5.2 Unsupported Operations
 - **`If` (`OpTypeIf`) & `While` (`OpTypeWhile`)**: Not supported; return `compute.ErrNotImplemented` (see Section 4).
 - **`Sort` (`OpTypeSort`) with non-standard comparator**: Only standard ascending (`<`, `<=`) and descending (`>`, `>=`) comparators on a key tensor are supported via native GPU `mlx::core::sort` / `mlx::core::argsort`. Custom comparators return `compute.ErrNotImplemented` with a message advising refactoring into a standard ascending/descending sort.
+- **`SelectAndScatterSum` (`OpTypeSelectAndScatterSum`)**: Not supported (`SelectAndScatterMax` and `SelectAndScatterMin` are supported).
+- **FFT & Quantized/Collective Ops (`OpTypeFFT`, `OpTypeFusedQuantizedDense`, `OpTypeQuantizedEmbeddingLookup`, `OpTypeAllReduce`)**: Not supported (`compute.ErrNotImplemented`).
 
 ### 5.3 Operation Quirks & Semantics Notes
 - **Shape Inference & Auto-Broadcasting**:
@@ -192,31 +188,22 @@ Every compiled `Executable` in `./compute/mlx` is represented as a **single flat
 - **`Pad` (`OpTypePad`)**:
   - Supports positive edge padding (`mlx::core::pad`), negative edge padding (cropping via `mlx::core::slice`), and interior padding (decomposed into `[N] -> [N, 1]` reshape, edge pad by `Interior`, flatten to `[N*(Interior+1)]`, and slice to `[N + (N-1)*Interior]`).
 - **`DotGeneral` (`OpTypeDotGeneral`)**:
-  - Normalizes arbitrary batch, cross, and contracting axes into rank-3 `[B, M, K] @ [B, K, N]` (with a fast path for standard 2D `[M, K] @ [K, N]` matmul).
-  - Supports `Float16`, `BFloat16`, and `Float32` via hardware `mlx::core::matmul`, `Complex64` via 4-real-matmul Gauss/standard decomposition (`(ac - bd) + (ad + bc)i`), and integer types via exact broadcast multiply + sum reduction. Also honors `DotGeneralConfig.AccumulatorDType` and `DotGeneralConfig.OutputDType`.
+  - Normalizes arbitrary batch, cross, and contracting axes into rank-3 `[B, M, K] @ [B, K, N]` (with a fast path for `[..., M, K] @ [K, N]` matmul that preserves leading dynamic dimensions).
+  - Supports `Float16`, `BFloat16`, and `Float32` via hardware `mlx::core::matmul`, `Complex64` via 4-real-matmul decomposition (`(ac - bd) + (ad + bc)i`), and integer types via exact broadcast multiply + sum reduction. Also honors `DotGeneralConfig.AccumulatorDType` and `DotGeneralConfig.OutputDType`.
 - **Graph Constants (`OpTypeConstant`)**:
   - When `Function.Constant(flat, dims...)` is called during graph building, the constant is immediately materialized once as an `mlx::core::array` owned by the `MLXTape` (zero per-execution allocation or copy overhead) and freed when the `Executable` / `Builder` is finalized.
-- **`ScatterSum`, `ScatterMax`, `ScatterMin`**:
-  - MLX provides native `mlx::core::scatter_add`, `mlx::core::scatter_max`, and `mlx::core::scatter_min` taking `(operand, indices, updates, axes)`. Duplicate indices accumulate properly using the corresponding reduction mode.
-- **`RNGBitGenerator`**:
-  - GoMLX expects deterministic Philox 4x32-10 state updates (`newState, values`). Rather than using MLX's stateful/keyed `mlx::core::random::bits` (which uses Threefry), `"mlx"` will share the pure-graph XLA-compliant Philox 4x32-10 implementation in `./internal/common` with `"mps"`.
+- **`Gather`, `ScatterSum`, `ScatterMax`, `ScatterMin`, `DynamicSlice`, `DynamicUpdateSlice`**:
+  - Maps general XLA `Gather` and `Scatter` index vector axes, offset/window axes, and collapsed/inserted axes directly to `mlx::core::gather`, `mlx::core::scatter`, `mlx::core::scatter_add`, `mlx::core::scatter_max`, and `mlx::core::scatter_min`.
+  - `DynamicSlice` and `DynamicUpdateSlice` normalize scalar or 1D vector `startIndices`, clamp them to `[0, dim - sliceSize]` per XLA semantics, and dispatch to `mlx::core::slice` / `mlx::core::slice_update`.
+- **`ConvGeneral` (`OpTypeConvGeneral`)**:
+  - Supports 1D, 2D, and 3D spatial convolutions, channel grouping (`featureGroupCount`), batch grouping (`batchGroupCount`), kernel dilation, input dilation, and asymmetric spatial padding via `mlx::core::conv_general`.
+- **`ReduceWindow` & `SelectAndScatter` via `mlx::core::as_strided`**:
+  - Arbitrary N-D sliding window reductions (`ReduceWindow` with `Sum`, `Product`, `Max`, `Min`, `LogicalAnd`, `LogicalOr`, `LogicalXor`, `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`) and `SelectAndScatterMax` / `SelectAndScatterMin` are implemented on the GPU by constructing a zero-copy strided window view `[outDims..., winDims...]` with `mlx::core::as_strided(contiguous(padded), viewShape, viewStrides, 0)` and reducing/arg-reducing over the window axes.
+  - **MLX `col_reduce` Quirk**: When `windowDilation > 1` on the innermost axis (`strides.back() != 1`) and `windowStride == 1` (`outDim > windowDilation`), MLX's Metal `col_reduce_small` kernel (`GeneralStridedReduce`) assumes `column < reduction_stride`. Materializing `mlx::core::contiguous` on `AsStrided` views whenever `strides.back() != 1` routes the reduction to `ContiguousReduce` (`row_reduce`) and avoids the stride assumption.
+- **`RNGBitGenerator` (`OpTypeRNGBitGenerator`)**:
+  - Uses `mlx::core::random::split` and `mlx::core::random::bits` seeded from the `[3]uint64` GoMLX RNG state (`[2]uint32` Threefry key + counter increment). For 64-bit integer types (`uint64`, `int64`), generates `[dims..., 2]` of `uint32` bits (`width = 4`) and views as the 64-bit dtype via `mlx::core::view`.
+- **Dead-Node Pruning (`computeReachable`)**:
+  - When `Call` inlines sub-functions or fused operations construct auxiliary outputs (such as `statesForVJP` in `FusedScaledDotProductAttention`), any tape nodes not reachable from the function's final `Return` outputs are pruned before compilation/replay so unused subgraphs incur zero runtime cost.
 
----
-
-## 6. Staged Implementation Plan
-
-1. **Step 1 — Shared Helpers & MLX Bridge Foundation**:
-   - Ensure `mlx` is installed (`brew install mlx`).
-   - Extract shared helpers into `./internal/common` (`slice.go`, `dotgeneral.go`, `rng.go`) and verify `./compute/mps` tests still pass.
-   - Implement `./internal/mlxbridge` (`bridge.h`, `bridge.cpp`, `bridge.go`, `bridge_nocgo.go`): device/stream initialization, `mlx::core::array` buffer lifecycle, `MLXTape` recording, `mlx::core::compile` wrapper, and `Execute` (with pre-`eval` buffer donation and `eager_contiguous` / `lazy_contiguous` modes).
-2. **Step 2 — `./compute/mlx` Core & Basic Operations**:
-   - Implement `Backend`, `Buffer` (with `arrayHandle` atomic cleanup), `Builder`, `Executable`, and `Function` with `Parameter`, `Constant`, `Identity`, `ConvertDType`, `Iota`, unary math/logical/bitwise ops, binary math/logical/bitwise ops, and comparison ops.
-3. **Step 3 — Shape, Matrix, Reduction & Selection Operations**:
-   - Implement `Reshape`, `Transpose`, `BroadcastInDim`, `Slice`, `Concatenate`, `Reverse`, `Pad`, `Where`, `Clamp`, `DotGeneral`, `Reduce*`, and `ArgMinMax`.
-4. **Step 4 — Indexing, Convolutions, Pooling, RNG, Control Flow & Fused Ops**:
-   - Implement `Gather`, `Scatter*`, `DynamicSlice`, `DynamicUpdateSlice`, `ConvGeneral`, `ReduceWindow`, `SelectAndScatter*`, `BatchNorm*`, `RNGBitGenerator`, `Call`, pattern-matched `Sort`, and fused ops (`FusedSoftmax`, `FusedLayerNorm`, `FusedActivation`, `FusedDense`, `FusedAttentionQKVProjection`, `FusedScaledDotProductAttention`).
-5. **Step 5 — `"mlx:dynamic"` Mode & Full Compliance Testing**:
-   - Implement `compute.DynamicOps` (`DynamicDimensionSize`, `DynamicReshape`, `DynamicBroadcastInDim`, `DynamicIota`, `DynamicPad`) and `lazy_contiguous` option.
-   - Run `backendtest.RunAll` compliance tests and benchmarks in `./compute/mlx/mlx_test.go`.
 
 
