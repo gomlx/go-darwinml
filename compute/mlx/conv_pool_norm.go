@@ -202,6 +202,49 @@ func (f *Function) ConvGeneral(
 		return &graphNode{id: id, shape: outShape, owner: f}, nil
 	}
 
+	padLo := make([]int, numSpatialDims)
+	padHi := make([]int, numSpatialDims)
+	inDil := make([]int, numSpatialDims)
+	hasNegativePad := false
+	for i := range numSpatialDims {
+		inDil[i] = inputDilations[i]
+		if paddings != nil && i < len(paddings) {
+			padLo[i] = paddings[i][0]
+			padHi[i] = paddings[i][1]
+			if padLo[i] < 0 || padHi[i] < 0 {
+				hasNegativePad = true
+			}
+		}
+	}
+
+	// Fast path for weight-gradient convolutions (convVJPWrtKernel) where the output spatial
+	// filter size is small (e.g. 1x1, 3x3) and the contracted kernel spatial size is large:
+	// use patch extraction + Split-K Matmul (matching MLX's internal conv_weight_backward_patches),
+	// which also avoids transposing NHWC inputs/cotangents/outputs.
+	if channelGroupCount == 1 && batchGroupCount == 1 && !hasNegativePad {
+		allInDilOne := true
+		for _, d := range inDil {
+			if d != 1 {
+				allInDilOne = false
+				break
+			}
+		}
+		outSpatialProd := 1
+		kSpatialProd := 1
+		for i := range numSpatialDims {
+			outSpatialProd *= outShape.Dimensions[axes.OutputSpatial[i]]
+			kSpatialProd *= kernelNode.shape.Dimensions[axes.KernelSpatial[i]]
+		}
+		cIn := inputNode.shape.Dimensions[axes.InputBatch]
+		nContract := inputNode.shape.Dimensions[axes.InputChannels]
+		patchElems := nContract * kSpatialProd * outSpatialProd * cIn
+		if allInDilOne && kSpatialProd > outSpatialProd && kSpatialProd >= 64 &&
+			(outSpatialProd == 1 || (outSpatialProd <= 9 && cIn*outSpatialProd <= 512 && patchElems <= 40*1024*1024)) {
+			return f.convWeightBackwardPatches(
+				inputNode, kernelNode, outShape, axes, strides, padLo, padHi, kernelDilations)
+		}
+	}
+
 	// Step 1: Transpose input to channels-last [N, spatial..., C_in].
 	rank := inputNode.shape.Rank()
 	inPerm := make([]int, rank)
@@ -232,21 +275,6 @@ func (f *Function) ConvGeneral(
 		kVal, err = f.Transpose(kVal, kPerm...)
 		if err != nil {
 			return nil, errors.Wrap(err, "ConvGeneral: transpose kernel")
-		}
-	}
-
-	padLo := make([]int, numSpatialDims)
-	padHi := make([]int, numSpatialDims)
-	inDil := make([]int, numSpatialDims)
-	hasNegativePad := false
-	for i := range numSpatialDims {
-		inDil[i] = inputDilations[i]
-		if paddings != nil && i < len(paddings) {
-			padLo[i] = paddings[i][0]
-			padHi[i] = paddings[i][1]
-			if padLo[i] < 0 || padHi[i] < 0 {
-				hasNegativePad = true
-			}
 		}
 	}
 
@@ -342,6 +370,191 @@ func (f *Function) ConvGeneral(
 	}
 
 	return &graphNode{id: convID, shape: outShape, owner: f}, nil
+}
+
+// convWeightBackwardPatches computes a convolution where the contracted spatial dimensions
+// (KernelSpatial, e.g. H_out x W_out) are much larger than the output spatial dimensions
+// (OutputSpatial, e.g. 1x1 or 3x3 filter size in convVJPWrtKernel), using strided patch
+// extraction + Split-K Matmul.
+func (f *Function) convWeightBackwardPatches(
+	inputNode, kernelNode *graphNode,
+	outShape shapes.Shape,
+	axes compute.ConvolveAxesConfig,
+	strides, padLo, padHi, kernelDilations []int,
+) (compute.Value, error) {
+	rank := inputNode.shape.Rank()
+	numSpatialDims := len(axes.InputSpatial)
+
+	// Step 1: Transpose inputNode to [InputChannels, InputSpatial..., InputBatch] = [N_contract, H_in..., C_in].
+	// For NHWC convVJPWrtKernel, this is the identity permutation [0, 1, 2, 3].
+	inPerm := make([]int, rank)
+	inPerm[0] = axes.InputChannels
+	for i, ax := range axes.InputSpatial {
+		inPerm[1+i] = ax
+	}
+	inPerm[rank-1] = axes.InputBatch
+
+	var inVal compute.Value = inputNode
+	var err error
+	if !isIdentityPerm(inPerm) {
+		inVal, err = f.Transpose(inVal, inPerm...)
+		if err != nil {
+			return nil, errors.Wrap(err, "convWeightBackwardPatches: transpose input")
+		}
+	}
+
+	// Step 2: Transpose kernelNode (cotangent) to [KernelInputChannels, KernelSpatial..., KernelOutputChannels]
+	// = [N_contract, K_spatial..., C_out]. For NHWC convVJPWrtKernel, this is also identity [0, 1, 2, 3].
+	kPerm := make([]int, rank)
+	kPerm[0] = axes.KernelInputChannels
+	for i, ax := range axes.KernelSpatial {
+		kPerm[1+i] = ax
+	}
+	kPerm[rank-1] = axes.KernelOutputChannels
+
+	var kVal compute.Value = kernelNode
+	if !isIdentityPerm(kPerm) {
+		kVal, err = f.Transpose(kVal, kPerm...)
+		if err != nil {
+			return nil, errors.Wrap(err, "convWeightBackwardPatches: transpose kernel")
+		}
+	}
+
+	// Step 3: Pad spatial dimensions 1..numSpatialDims of inVal if needed.
+	needsPad := false
+	for i := range numSpatialDims {
+		if padLo[i] > 0 || padHi[i] > 0 {
+			needsPad = true
+			break
+		}
+	}
+	if needsPad {
+		zeroConst, err := f.makeScalarConst(0, inputNode.shape.DType)
+		if err != nil {
+			return nil, errors.Wrap(err, "convWeightBackwardPatches: zero constant")
+		}
+		padAxes := make([]compute.PadAxis, rank)
+		for i := range numSpatialDims {
+			padAxes[1+i] = compute.PadAxis{Start: padLo[i], End: padHi[i]}
+		}
+		inVal, err = f.Pad(inVal, zeroConst, padAxes...)
+		if err != nil {
+			return nil, errors.Wrap(err, "convWeightBackwardPatches: pad")
+		}
+	}
+
+	inPaddedNode := inVal.(*graphNode)
+	kCurNode := kVal.(*graphNode)
+	pDims := inPaddedNode.shape.Dimensions
+	kDims := kCurNode.shape.Dimensions
+
+	nContract := pDims[0]
+	cIn := pDims[rank-1]
+	cOut := kDims[rank-1]
+
+	mContract := nContract
+	oProd := 1
+	outSpatialDims := make([]int, numSpatialDims)
+	for i := range numSpatialDims {
+		mContract *= kDims[1+i]
+		outSpatialDims[i] = outShape.Dimensions[axes.OutputSpatial[i]]
+		oProd *= outSpatialDims[i]
+	}
+
+	// Step 4: Extract patches [N_contract, K_0..., O_0..., C_in] via AsStrided (or direct reshape if 1x1 stride-1).
+	var patches2DID mlxbridge.NodeID
+	isDirectReshape := oProd == 1
+	if isDirectReshape {
+		for i := range numSpatialDims {
+			if kDims[1+i] != pDims[1+i] || kernelDilations[i] != 1 {
+				isDirectReshape = false
+				break
+			}
+		}
+	}
+
+	if isDirectReshape {
+		patches2DID, err = f.builder.tape.AddReshape(inPaddedNode.id, []int{mContract, cIn})
+		if err != nil {
+			return nil, errors.Wrap(err, "convWeightBackwardPatches: reshape 1x1")
+		}
+	} else {
+		rowStrides := make([]int64, rank)
+		rowStrides[rank-1] = 1
+		for i := rank - 2; i >= 0; i-- {
+			rowStrides[i] = rowStrides[i+1] * int64(pDims[i+1])
+		}
+
+		patchShape := make([]int, 0, 2+2*numSpatialDims)
+		patchStrides := make([]int64, 0, 2+2*numSpatialDims)
+		patchShape = append(patchShape, nContract)
+		patchStrides = append(patchStrides, rowStrides[0])
+		for i := range numSpatialDims {
+			patchShape = append(patchShape, kDims[1+i])
+			patchStrides = append(patchStrides, rowStrides[1+i]*int64(kernelDilations[i]))
+		}
+		for i := range numSpatialDims {
+			patchShape = append(patchShape, outSpatialDims[i])
+			patchStrides = append(patchStrides, rowStrides[1+i]*int64(strides[i]))
+		}
+		patchShape = append(patchShape, cIn)
+		patchStrides = append(patchStrides, rowStrides[rank-1])
+
+		stridedID, err := f.builder.tape.AddAsStrided(inPaddedNode.id, patchShape, patchStrides, 0)
+		if err != nil {
+			return nil, errors.Wrap(err, "convWeightBackwardPatches: as_strided")
+		}
+		patches2DID, err = f.builder.tape.AddReshape(stridedID, []int{mContract, oProd * cIn})
+		if err != nil {
+			return nil, errors.Wrap(err, "convWeightBackwardPatches: reshape patches")
+		}
+	}
+
+	// Step 5: Compute patches_t [O_prod * C_in, M_contract] @ cotan_2d [M_contract, C_out]
+	// -> [O_prod * C_in, C_out] -> [O_0, ..., O_{D-1}, C_in, C_out].
+	patchesTID, err := f.builder.tape.AddTranspose(patches2DID, []int{1, 0})
+	if err != nil {
+		return nil, errors.Wrap(err, "convWeightBackwardPatches: transpose patches")
+	}
+	cotan2DID, err := f.builder.tape.AddReshape(kCurNode.id, []int{mContract, cOut})
+	if err != nil {
+		return nil, errors.Wrap(err, "convWeightBackwardPatches: reshape cotan")
+	}
+	mmID, err := f.builder.tape.AddMatmul(patchesTID, cotan2DID)
+	if err != nil {
+		return nil, errors.Wrap(err, "convWeightBackwardPatches: matmul")
+	}
+
+	canonDims := make([]int, rank)
+	copy(canonDims[:numSpatialDims], outSpatialDims)
+	canonDims[numSpatialDims] = cIn
+	canonDims[numSpatialDims+1] = cOut
+	outID, err := f.builder.tape.AddReshape(mmID, canonDims)
+	if err != nil {
+		return nil, errors.Wrap(err, "convWeightBackwardPatches: reshape output")
+	}
+
+	// Step 6: Transpose from [OutputSpatial..., OutputBatch(C_in), OutputChannels(C_out)] to outShape.
+	// For NHWC convVJPWrtKernel, invPerm is the identity [0, 1, 2, 3].
+	fwdPerm := make([]int, rank)
+	for i, ax := range axes.OutputSpatial {
+		fwdPerm[i] = ax
+	}
+	fwdPerm[numSpatialDims] = axes.OutputBatch
+	fwdPerm[numSpatialDims+1] = axes.OutputChannels
+
+	invPerm := make([]int, rank)
+	for i, v := range fwdPerm {
+		invPerm[v] = i
+	}
+	if !isIdentityPerm(invPerm) {
+		outID, err = f.builder.tape.AddTranspose(outID, invPerm)
+		if err != nil {
+			return nil, errors.Wrap(err, "convWeightBackwardPatches: transpose output")
+		}
+	}
+
+	return &graphNode{id: outID, shape: outShape, owner: f}, nil
 }
 
 // ===========================================================================
@@ -440,30 +653,7 @@ func (f *Function) ReduceWindow(
 		paddedNode = paddedVal.(*graphNode)
 	}
 
-	// Step 2: Construct a 2*R strided view [O_0, ..., O_{R-1}, W_0, ..., W_{R-1}] over the contiguous padded tensor.
 	pDims := paddedNode.shape.Dimensions
-	rowStrides := make([]int64, rank)
-	rowStrides[rank-1] = 1
-	for i := rank - 2; i >= 0; i-- {
-		rowStrides[i] = rowStrides[i+1] * int64(pDims[i+1])
-	}
-
-	viewShape := make([]int, 2*rank)
-	viewStrides := make([]int64, 2*rank)
-	reduceAxes := make([]int, rank)
-	for i := range rank {
-		viewShape[i] = outShape.Dimensions[i]
-		viewShape[rank+i] = winDims[i]
-		viewStrides[i] = rowStrides[i] * int64(winStrides[i])
-		viewStrides[rank+i] = rowStrides[i] * int64(winDil[i])
-		reduceAxes[i] = rank + i
-	}
-
-	stridedID, err := f.builder.tape.AddAsStrided(paddedNode.id, viewShape, viewStrides, 0)
-	if err != nil {
-		return nil, errors.Wrap(err, "ReduceWindow: as_strided")
-	}
-
 	var mlxOp mlxbridge.ReduceOp
 	switch reductionType {
 	case compute.ReduceOpSum:
@@ -478,6 +668,92 @@ func (f *Function) ReduceWindow(
 		return nil, errors.Errorf("ReduceWindow: unsupported reduction type %v", reductionType)
 	}
 
+	// Fast path for non-overlapping windows with unit window dilation:
+	// use a zero-copy Reshape splitting each active window axis (O_i * W_i) -> (O_i, W_i)
+	// followed by Reduce, avoiding AsStrided so mlx::core::compile can fuse across pooling.
+	nonOverlapping := true
+	needsSlice := false
+	coveredDims := make([]int, rank)
+	for i := range rank {
+		if winStrides[i] != winDims[i] || winDil[i] != 1 {
+			nonOverlapping = false
+			break
+		}
+		coveredDims[i] = outShape.Dimensions[i] * winDims[i]
+		if coveredDims[i] > pDims[i] {
+			nonOverlapping = false
+			break
+		}
+		if coveredDims[i] < pDims[i] {
+			needsSlice = true
+		}
+	}
+
+	if nonOverlapping {
+		curID := paddedNode.id
+		if needsSlice {
+			starts := make([]int, rank)
+			stridesOnes := make([]int, rank)
+			for i := range rank {
+				stridesOnes[i] = 1
+			}
+			curID, err = f.builder.tape.AddSlice(curID, starts, coveredDims, stridesOnes)
+			if err != nil {
+				return nil, errors.Wrap(err, "ReduceWindow: slice covered")
+			}
+		}
+		splitShape := make([]int, 0, 2*rank)
+		reduceAxes := make([]int, 0, rank)
+		for i := range rank {
+			splitShape = append(splitShape, outShape.Dimensions[i])
+			if winDims[i] > 1 {
+				reduceAxes = append(reduceAxes, len(splitShape))
+				splitShape = append(splitShape, winDims[i])
+			}
+		}
+		if len(reduceAxes) == 0 {
+			return &graphNode{id: curID, shape: outShape, owner: f}, nil
+		}
+		reshapedID, err := f.builder.tape.AddReshape(curID, splitShape)
+		if err != nil {
+			return nil, errors.Wrap(err, "ReduceWindow: reshape")
+		}
+		redID, err := f.builder.tape.AddReduce(mlxOp, reshapedID, reduceAxes)
+		if err != nil {
+			return nil, errors.Wrap(err, "ReduceWindow: reduce")
+		}
+		return &graphNode{id: redID, shape: outShape, owner: f}, nil
+	}
+
+	// Step 2: General overlapping or dilated windows — construct an interleaved strided view
+	// where window axes W_i (only for winDims[i] > 1) are placed immediately after O_i,
+	// preserving stride-1 inner channel axes at the end for coalesced GPU reductions.
+	rowStrides := make([]int64, rank)
+	rowStrides[rank-1] = 1
+	for i := rank - 2; i >= 0; i-- {
+		rowStrides[i] = rowStrides[i+1] * int64(pDims[i+1])
+	}
+
+	viewShape := make([]int, 0, 2*rank)
+	viewStrides := make([]int64, 0, 2*rank)
+	reduceAxes := make([]int, 0, rank)
+	for i := range rank {
+		viewShape = append(viewShape, outShape.Dimensions[i])
+		viewStrides = append(viewStrides, rowStrides[i]*int64(winStrides[i]))
+		if winDims[i] > 1 {
+			reduceAxes = append(reduceAxes, len(viewShape))
+			viewShape = append(viewShape, winDims[i])
+			viewStrides = append(viewStrides, rowStrides[i]*int64(winDil[i]))
+		}
+	}
+
+	stridedID, err := f.builder.tape.AddAsStrided(paddedNode.id, viewShape, viewStrides, 0)
+	if err != nil {
+		return nil, errors.Wrap(err, "ReduceWindow: as_strided")
+	}
+	if len(reduceAxes) == 0 {
+		return &graphNode{id: stridedID, shape: outShape, owner: f}, nil
+	}
 	redID, err := f.builder.tape.AddReduce(mlxOp, stridedID, reduceAxes)
 	if err != nil {
 		return nil, errors.Wrap(err, "ReduceWindow: reduce")
