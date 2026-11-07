@@ -140,6 +140,36 @@ func (f *Function) DotGeneral(
 	lhsBatchSize, lhsCrossSize, contractingSize, lhsPermMK, lhsPermKM := classifyAxes(lhsNode.shape, lhsBatch, lhsContracting)
 	_, rhsCrossSize, _, rhsPermNK, rhsPermKN := classifyAxes(rhsNode.shape, rhsBatch, rhsContracting)
 
+	// Fast path when both operands have 1 cross axis and 1 contracting axis
+	// (e.g., BSHD attention [B, S, H, D] with batch=[0, 2]): transpose directly to
+	// [batch..., M, K] and [batch..., K, N] and call Matmul without reshaping batch dims.
+	if len(lhsContracting) == 1 && len(rhsContracting) == 1 &&
+		lhsNode.shape.Rank() == len(lhsBatch)+2 && rhsNode.shape.Rank() == len(rhsBatch)+2 {
+		if !isIdentityPerm(lhsPermMK) {
+			lhsID, err = f.builder.tape.AddTranspose(lhsID, lhsPermMK)
+			if err != nil {
+				return nil, errors.Wrap(err, "DotGeneral: lhs transpose")
+			}
+		}
+		if !isIdentityPerm(rhsPermKN) {
+			rhsID, err = f.builder.tape.AddTranspose(rhsID, rhsPermKN)
+			if err != nil {
+				return nil, errors.Wrap(err, "DotGeneral: rhs transpose")
+			}
+		}
+		resID, err := f.builder.tape.AddMatmul(lhsID, rhsID)
+		if err != nil {
+			return nil, errors.Wrap(err, "DotGeneral: matmul")
+		}
+		if outDType != computeDType {
+			resID, err = f.builder.tape.AddConvertDType(resID, dtypeToBridgeDType(outDType))
+			if err != nil {
+				return nil, errors.Wrap(err, "DotGeneral: convert output")
+			}
+		}
+		return &graphNode{id: resID, shape: outShape, owner: f}, nil
+	}
+
 	hasBatch := len(lhsBatch) > 0
 	batchSize := lhsBatchSize
 

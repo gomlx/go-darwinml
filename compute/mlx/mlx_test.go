@@ -246,3 +246,17 @@ func TestCompliance(t *testing.T) {
 		})
 	}
 }
+
+// BenchmarkCompliance runs all compliance (backendtest) compute.Backend benchmarks on the "mlx" backend.
+// To run:
+//
+//	$ go test -bench=. -benchmem ./compute/mlx
+func BenchmarkCompliance(b *testing.B) {
+	backend, err := mlx.New("")
+	if err != nil {
+		b.Fatalf("mlx.New(\"\") failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	backendtest.RunAllBenchmarks(b, backend)
+}

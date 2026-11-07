@@ -27,6 +27,20 @@ func TestCompliance(t *testing.T) {
 	backendtest.RunAll(t, backend, nil)
 }
 
+// BenchmarkCompliance runs all compliance (backendtest) compute.Backend benchmarks on the "mps" backend.
+// To run:
+//
+//	$ go test -bench=. -benchmem ./compute/mps
+func BenchmarkCompliance(b *testing.B) {
+	backend, err := New("")
+	if err != nil {
+		b.Fatalf("New() failed: %+v", err)
+	}
+	defer backend.Finalize()
+
+	backendtest.RunAllBenchmarks(b, backend)
+}
+
 // TestBackendCreation tests that the backend can be created.
 func TestBackendCreation(t *testing.T) {
 	backend, err := New("")
