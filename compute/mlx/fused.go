@@ -87,7 +87,10 @@ func (f *Function) FusedLayerNorm(x compute.Value, axes []int, epsilon float64, 
 	}
 	outShape := node.shape.Clone()
 
-	// Fast path: single trailing axis normalization uses mlx::core::fast::layer_norm.
+	// Fast path: single trailing axis normalization uses mlx::core::fast::layer_norm
+	// when gamma/beta are 1D (or nil). When gamma/beta are already broadcast-shaped
+	// (e.g., [1, 1, 1, C] from norm.LayerNorm), using the decomposed path below allows
+	// mlx::core::compile CSE to share the mean/variance reductions with the decomposed VJP.
 	if len(normAxes) == 1 && normAxes[0] == rank-1 &&
 		(gammaNode == nil || gammaNode.shape.Rank() == 1) &&
 		(betaNode == nil || betaNode.shape.Rank() == 1) {

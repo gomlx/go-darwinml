@@ -93,7 +93,8 @@ func (f *Function) DotGeneral(
 		}
 	}
 
-	// Fast path: standard 2D matmul [M, K] x [K, N] -> [M, N].
+	// Fast path: standard 2D/batched matmul [B..., M, K] x [B..., K, N] -> [B..., M, N]
+	// (including when rhs is [B..., N, K] with rhsContracting == [rhsRank-1]).
 	if isSimpleMatMul(lhsNode.shape, lhsContracting, lhsBatch, rhsNode.shape, rhsContracting, rhsBatch) {
 		resID, err := f.builder.tape.AddMatmul(lhsID, rhsID)
 		if err != nil {
@@ -107,62 +108,165 @@ func (f *Function) DotGeneral(
 		}
 		return &graphNode{id: resID, shape: outShape, owner: f}, nil
 	}
-
-	// General path: normalize to rank-3 [B, M, K] x [B, K, N] -> [B, M, N] -> reshape to outShape.
-	lhsBatchSize, lhsCrossSize, contractingSize, lhsPerm := classifyAxes(lhsNode.shape, lhsBatch, lhsContracting)
-	_, rhsCrossSize, _, rhsPerm := classifyAxes(rhsNode.shape, rhsBatch, rhsContracting)
-
-	batchSize := lhsBatchSize
-	if len(lhsBatch) == 0 {
-		batchSize = 1
-	}
-
-	if !isIdentityPerm(lhsPerm) {
-		lhsID, err = f.builder.tape.AddTranspose(lhsID, lhsPerm)
-		if err != nil {
-			return nil, errors.Wrap(err, "DotGeneral: lhs transpose")
+	if isTransposedRhsMatMul(lhsNode.shape, lhsContracting, lhsBatch, rhsNode.shape, rhsContracting, rhsBatch) {
+		rRank := rhsNode.shape.Rank()
+		perm := make([]int, rRank)
+		for i := range rRank {
+			perm[i] = i
 		}
-	}
-	if !isIdentityPerm(rhsPerm) {
-		rhsID, err = f.builder.tape.AddTranspose(rhsID, rhsPerm)
+		perm[rRank-2], perm[rRank-1] = rRank-1, rRank-2
+		rhsT, err := f.builder.tape.AddTranspose(rhsID, perm)
 		if err != nil {
 			return nil, errors.Wrap(err, "DotGeneral: rhs transpose")
 		}
+		resID, err := f.builder.tape.AddMatmul(lhsID, rhsT)
+		if err != nil {
+			return nil, errors.Wrap(err, "DotGeneral: matmul")
+		}
+		if outDType != computeDType {
+			resID, err = f.builder.tape.AddConvertDType(resID, dtypeToBridgeDType(outDType))
+			if err != nil {
+				return nil, errors.Wrap(err, "DotGeneral: convert output")
+			}
+		}
+		return &graphNode{id: resID, shape: outShape, owner: f}, nil
 	}
 
-	// Reshape lhs to [B, M, K].
-	lhsID, err = f.builder.tape.AddReshape(lhsID, []int{batchSize, lhsCrossSize, contractingSize})
-	if err != nil {
-		return nil, errors.Wrap(err, "DotGeneral: lhs reshape")
+	// General path: normalize to 2D [M, K] x [K, N] (when len(lhsBatch) == 0)
+	// or 3D [B, M, K] x [B, K, N] (when len(lhsBatch) > 0).
+	// When an operand's axes are already ordered as [batch..., contracting..., cross...]
+	// (e.g., weight gradients dW = X^T @ dY), reshape first (zero-copy!) and transpose the
+	// 2D/3D matrix rather than transposing the N-D tensor before reshape.
+	lhsBatchSize, lhsCrossSize, contractingSize, lhsPermMK, lhsPermKM := classifyAxes(lhsNode.shape, lhsBatch, lhsContracting)
+	_, rhsCrossSize, _, rhsPermNK, rhsPermKN := classifyAxes(rhsNode.shape, rhsBatch, rhsContracting)
+
+	// Fast path when both operands have 1 cross axis and 1 contracting axis
+	// (e.g., BSHD attention [B, S, H, D] with batch=[0, 2]): transpose directly to
+	// [batch..., M, K] and [batch..., K, N] and call Matmul without reshaping batch dims.
+	if len(lhsContracting) == 1 && len(rhsContracting) == 1 &&
+		lhsNode.shape.Rank() == len(lhsBatch)+2 && rhsNode.shape.Rank() == len(rhsBatch)+2 {
+		if !isIdentityPerm(lhsPermMK) {
+			lhsID, err = f.builder.tape.AddTranspose(lhsID, lhsPermMK)
+			if err != nil {
+				return nil, errors.Wrap(err, "DotGeneral: lhs transpose")
+			}
+		}
+		if !isIdentityPerm(rhsPermKN) {
+			rhsID, err = f.builder.tape.AddTranspose(rhsID, rhsPermKN)
+			if err != nil {
+				return nil, errors.Wrap(err, "DotGeneral: rhs transpose")
+			}
+		}
+		resID, err := f.builder.tape.AddMatmul(lhsID, rhsID)
+		if err != nil {
+			return nil, errors.Wrap(err, "DotGeneral: matmul")
+		}
+		if outDType != computeDType {
+			resID, err = f.builder.tape.AddConvertDType(resID, dtypeToBridgeDType(outDType))
+			if err != nil {
+				return nil, errors.Wrap(err, "DotGeneral: convert output")
+			}
+		}
+		return &graphNode{id: resID, shape: outShape, owner: f}, nil
 	}
 
-	// Reshape rhs to [B, N, K] (since rhsPerm orders [batch, cross, contracting]).
-	rhsID, err = f.builder.tape.AddReshape(rhsID, []int{batchSize, rhsCrossSize, contractingSize})
-	if err != nil {
-		return nil, errors.Wrap(err, "DotGeneral: rhs reshape")
+	hasBatch := len(lhsBatch) > 0
+	batchSize := lhsBatchSize
+
+	// Prepare lhs in [M, K] or [B, M, K].
+	if isIdentityPerm(lhsPermKM) && !isIdentityPerm(lhsPermMK) {
+		if hasBatch {
+			lhsID, err = f.builder.tape.AddReshape(lhsID, []int{batchSize, contractingSize, lhsCrossSize})
+		} else {
+			lhsID, err = f.builder.tape.AddReshape(lhsID, []int{contractingSize, lhsCrossSize})
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "DotGeneral: lhs reshape KM")
+		}
+		if hasBatch {
+			lhsID, err = f.builder.tape.AddTranspose(lhsID, []int{0, 2, 1})
+		} else {
+			lhsID, err = f.builder.tape.AddTranspose(lhsID, []int{1, 0})
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "DotGeneral: lhs transpose KM->MK")
+		}
+	} else {
+		if !isIdentityPerm(lhsPermMK) {
+			lhsID, err = f.builder.tape.AddTranspose(lhsID, lhsPermMK)
+			if err != nil {
+				return nil, errors.Wrap(err, "DotGeneral: lhs transpose")
+			}
+		}
+		if hasBatch {
+			lhsID, err = f.builder.tape.AddReshape(lhsID, []int{batchSize, lhsCrossSize, contractingSize})
+		} else {
+			lhsID, err = f.builder.tape.AddReshape(lhsID, []int{lhsCrossSize, contractingSize})
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "DotGeneral: lhs reshape")
+		}
 	}
 
-	// Transpose rhs from [B, N, K] to [B, K, N].
-	rhsID, err = f.builder.tape.AddTranspose(rhsID, []int{0, 2, 1})
-	if err != nil {
-		return nil, errors.Wrap(err, "DotGeneral: rhs transpose for matmul")
+	// Prepare rhs in [K, N] or [B, K, N].
+	if isIdentityPerm(rhsPermKN) {
+		if hasBatch {
+			rhsID, err = f.builder.tape.AddReshape(rhsID, []int{batchSize, contractingSize, rhsCrossSize})
+		} else {
+			rhsID, err = f.builder.tape.AddReshape(rhsID, []int{contractingSize, rhsCrossSize})
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "DotGeneral: rhs reshape KN")
+		}
+	} else if isIdentityPerm(rhsPermNK) {
+		if hasBatch {
+			rhsID, err = f.builder.tape.AddReshape(rhsID, []int{batchSize, rhsCrossSize, contractingSize})
+		} else {
+			rhsID, err = f.builder.tape.AddReshape(rhsID, []int{rhsCrossSize, contractingSize})
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "DotGeneral: rhs reshape NK")
+		}
+		if hasBatch {
+			rhsID, err = f.builder.tape.AddTranspose(rhsID, []int{0, 2, 1})
+		} else {
+			rhsID, err = f.builder.tape.AddTranspose(rhsID, []int{1, 0})
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "DotGeneral: rhs transpose NK->KN")
+		}
+	} else {
+		rhsID, err = f.builder.tape.AddTranspose(rhsID, rhsPermKN)
+		if err != nil {
+			return nil, errors.Wrap(err, "DotGeneral: rhs transpose")
+		}
+		if hasBatch {
+			rhsID, err = f.builder.tape.AddReshape(rhsID, []int{batchSize, contractingSize, rhsCrossSize})
+		} else {
+			rhsID, err = f.builder.tape.AddReshape(rhsID, []int{contractingSize, rhsCrossSize})
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "DotGeneral: rhs reshape")
+		}
 	}
 
-	// Batched matmul: [B, M, K] x [B, K, N] -> [B, M, N].
+	// Matmul: [M, K] x [K, N] -> [M, N] or [B, M, K] x [B, K, N] -> [B, M, N].
 	resID, err := f.builder.tape.AddMatmul(lhsID, rhsID)
 	if err != nil {
 		return nil, errors.Wrap(err, "DotGeneral: matmul")
 	}
 
-	// Reshape from [B, M, N] to outShape.Dimensions, encoding any dynamic dimensions
+	// Reshape to outShape.Dimensions, encoding any dynamic dimensions
 	// by referencing the corresponding lhs or rhs input node and axis.
-	outReshapeDims := encodeDotGeneralOutputDims(
-		outShape.Dimensions,
-		lhsNode, lhsBatch, lhsContracting,
-		rhsNode, rhsBatch, rhsContracting)
-	resID, err = f.builder.tape.AddReshape(resID, outReshapeDims)
-	if err != nil {
-		return nil, errors.Wrap(err, "DotGeneral: output reshape")
+	if hasBatch || outShape.Rank() != 2 || outShape.IsDynamic() || !slices.Equal(outShape.Dimensions, []int{lhsCrossSize, rhsCrossSize}) {
+		outReshapeDims := encodeDotGeneralOutputDims(
+			outShape.Dimensions,
+			lhsNode, lhsBatch, lhsContracting,
+			rhsNode, rhsBatch, rhsContracting)
+		resID, err = f.builder.tape.AddReshape(resID, outReshapeDims)
+		if err != nil {
+			return nil, errors.Wrap(err, "DotGeneral: output reshape")
+		}
 	}
 
 	if outDType != computeDType {
@@ -288,19 +392,55 @@ func isSimpleMatMul(
 	lhsShape shapes.Shape, lhsContractingAxes, lhsBatchAxes []int,
 	rhsShape shapes.Shape, rhsContractingAxes, rhsBatchAxes []int,
 ) bool {
-	if len(lhsBatchAxes) != 0 || len(rhsBatchAxes) != 0 {
-		return false
-	}
-	if lhsShape.Rank() < 2 || rhsShape.Rank() != 2 {
-		return false
-	}
 	if len(lhsContractingAxes) != 1 || len(rhsContractingAxes) != 1 {
 		return false
 	}
-	return lhsContractingAxes[0] == lhsShape.Rank()-1 && rhsContractingAxes[0] == 0
+	b := len(lhsBatchAxes)
+	if b != len(rhsBatchAxes) {
+		return false
+	}
+	if b == 0 {
+		return lhsShape.Rank() >= 2 && rhsShape.Rank() == 2 &&
+			lhsContractingAxes[0] == lhsShape.Rank()-1 && rhsContractingAxes[0] == 0
+	}
+	if lhsShape.Rank() != b+2 || rhsShape.Rank() != b+2 {
+		return false
+	}
+	for i := range b {
+		if lhsBatchAxes[i] != i || rhsBatchAxes[i] != i {
+			return false
+		}
+	}
+	return lhsContractingAxes[0] == b+1 && rhsContractingAxes[0] == b
 }
 
-func classifyAxes(shape shapes.Shape, batchAxes, contractingAxes []int) (batchSize, crossSize, contractingSize int, perm []int) {
+func isTransposedRhsMatMul(
+	lhsShape shapes.Shape, lhsContractingAxes, lhsBatchAxes []int,
+	rhsShape shapes.Shape, rhsContractingAxes, rhsBatchAxes []int,
+) bool {
+	if len(lhsContractingAxes) != 1 || len(rhsContractingAxes) != 1 {
+		return false
+	}
+	b := len(lhsBatchAxes)
+	if b != len(rhsBatchAxes) {
+		return false
+	}
+	if b == 0 {
+		return lhsShape.Rank() >= 2 && rhsShape.Rank() == 2 &&
+			lhsContractingAxes[0] == lhsShape.Rank()-1 && rhsContractingAxes[0] == 1
+	}
+	if lhsShape.Rank() != b+2 || rhsShape.Rank() != b+2 {
+		return false
+	}
+	for i := range b {
+		if lhsBatchAxes[i] != i || rhsBatchAxes[i] != i {
+			return false
+		}
+	}
+	return lhsContractingAxes[0] == b+1 && rhsContractingAxes[0] == b+1
+}
+
+func classifyAxes(shape shapes.Shape, batchAxes, contractingAxes []int) (batchSize, crossSize, contractingSize int, permCrossFirst, permContractFirst []int) {
 	rank := shape.Rank()
 	batchSet := make(map[int]bool, len(batchAxes))
 	for _, a := range batchAxes {
@@ -318,10 +458,15 @@ func classifyAxes(shape shapes.Shape, batchAxes, contractingAxes []int) (batchSi
 		}
 	}
 
-	perm = make([]int, 0, rank)
-	perm = append(perm, batchAxes...)
-	perm = append(perm, crossAxes...)
-	perm = append(perm, contractingAxes...)
+	permCrossFirst = make([]int, 0, rank)
+	permCrossFirst = append(permCrossFirst, batchAxes...)
+	permCrossFirst = append(permCrossFirst, crossAxes...)
+	permCrossFirst = append(permCrossFirst, contractingAxes...)
+
+	permContractFirst = make([]int, 0, rank)
+	permContractFirst = append(permContractFirst, batchAxes...)
+	permContractFirst = append(permContractFirst, contractingAxes...)
+	permContractFirst = append(permContractFirst, crossAxes...)
 
 	prod := func(axes []int) int {
 		p := 1

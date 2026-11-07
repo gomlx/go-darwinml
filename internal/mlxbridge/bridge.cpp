@@ -652,68 +652,191 @@ mlx::core::array evalSelectAndScatter(
         mlx::core::array pad_val = makeSelectPadScalar(operand.dtype(), is_max);
         p = mlx::core::pad(operand, pad_axes, low_pads, high_pads, pad_val);
     }
-    if (!p.flags().row_contiguous) {
-        p = mlx::core::contiguous(p);
-    }
-
     mlx::core::Shape p_shape = p.shape();
     int32_t pn = static_cast<int32_t>(p.size());
     if (pn == 0 || source.size() == 0) {
         return mlx::core::zeros(operand.shape(), operand.dtype());
     }
 
-    mlx::core::Strides row_strides(rank, 1);
-    for (int i = rank - 2; i >= 0; --i) {
-        row_strides[i] = row_strides[i + 1] * static_cast<int64_t>(p_shape[i + 1]);
-    }
-
-    mlx::core::Shape view_shape(2 * rank);
-    mlx::core::Strides view_strides(2 * rank);
-    int32_t o_prod = 1;
-    int32_t w_prod = 1;
+    // Fast path for non-overlapping windows (e.g. standard MaxPool / MinPool backward pass
+    // where win_strides[i] == win_dims[i]). Uses a zero-copy reshape + hierarchical argmax/argmin
+    // + elementwise where(), avoiding as_strided copies and atomic scatter_add.
+    bool non_overlapping = true;
+    mlx::core::Shape covered_shape(rank);
+    bool needs_tail_pad = false;
     for (int i = 0; i < rank; ++i) {
-        view_shape[i] = source.shape(i);
-        view_shape[rank + i] = win_dims[i];
-        view_strides[i] = row_strides[i] * static_cast<int64_t>(win_strides[i]);
-        view_strides[rank + i] = row_strides[i];
-        o_prod *= source.shape(i);
-        w_prod *= win_dims[i];
+        if (win_strides[i] != win_dims[i]) {
+            non_overlapping = false;
+            break;
+        }
+        covered_shape[i] = source.shape(i) * win_dims[i];
+        if (covered_shape[i] > p_shape[i]) {
+            non_overlapping = false;
+            break;
+        }
+        if (covered_shape[i] < p_shape[i]) {
+            needs_tail_pad = true;
+        }
     }
 
-    mlx::core::Shape flat_win_shape(rank + 1);
-    for (int i = 0; i < rank; ++i) {
-        flat_win_shape[i] = source.shape(i);
+    mlx::core::array out_padded = p;
+    if (non_overlapping) {
+        mlx::core::array p_cov = p;
+        if (needs_tail_pad) {
+            mlx::core::Shape zero_start(rank, 0);
+            p_cov = mlx::core::slice(p, zero_start, covered_shape);
+        }
+        if (!p_cov.flags().row_contiguous) {
+            p_cov = mlx::core::contiguous(p_cov);
+        }
+
+        mlx::core::Shape split_shape;
+        mlx::core::Shape src_exp_shape;
+        mlx::core::Shape r_grid_shape;
+        std::vector<int> win_axes;
+        int32_t w_prod = 1;
+        for (int i = 0; i < rank; ++i) {
+            split_shape.push_back(source.shape(i));
+            src_exp_shape.push_back(source.shape(i));
+            r_grid_shape.push_back(1);
+            if (win_dims[i] > 1) {
+                win_axes.push_back(static_cast<int>(split_shape.size()));
+                split_shape.push_back(win_dims[i]);
+                src_exp_shape.push_back(1);
+                r_grid_shape.push_back(win_dims[i]);
+                w_prod *= win_dims[i];
+            }
+        }
+
+        mlx::core::array out_cov = source;
+        if (!win_axes.empty()) {
+            mlx::core::array p_split = mlx::core::reshape(p_cov, split_shape);
+            mlx::core::array win_ext = is_max
+                ? mlx::core::max(p_split, win_axes, /*keepdims=*/true)
+                : mlx::core::min(p_split, win_axes, /*keepdims=*/true);
+            mlx::core::array r_grid = mlx::core::reshape(
+                mlx::core::arange(0, w_prod, mlx::core::int32),
+                r_grid_shape);
+            mlx::core::array cand_idx = mlx::core::where(
+                mlx::core::equal(p_split, win_ext),
+                r_grid,
+                mlx::core::array(w_prod, mlx::core::int32));
+            mlx::core::array first_idx = mlx::core::min(cand_idx, win_axes, /*keepdims=*/true);
+            mlx::core::array mask = mlx::core::equal(r_grid, first_idx);
+
+            mlx::core::array src_exp = mlx::core::reshape(source, src_exp_shape);
+            mlx::core::array zero_val = mlx::core::astype(mlx::core::array(0), operand.dtype());
+            mlx::core::array out_split = mlx::core::where(mask, src_exp, zero_val);
+            out_cov = mlx::core::reshape(out_split, covered_shape);
+        }
+
+        if (needs_tail_pad) {
+            std::vector<int> tail_axes;
+            mlx::core::Shape tail_lo, tail_hi;
+            for (int i = 0; i < rank; ++i) {
+                if (covered_shape[i] < p_shape[i]) {
+                    tail_axes.push_back(i);
+                    tail_lo.push_back(0);
+                    tail_hi.push_back(p_shape[i] - covered_shape[i]);
+                }
+            }
+            mlx::core::array zero_val = mlx::core::astype(mlx::core::array(0), operand.dtype());
+            out_padded = mlx::core::pad(out_cov, tail_axes, tail_lo, tail_hi, zero_val);
+        } else {
+            out_padded = std::move(out_cov);
+        }
+    } else {
+        if (!p.flags().row_contiguous) {
+            p = mlx::core::contiguous(p);
+        }
+
+        mlx::core::Strides row_strides(rank, 1);
+        for (int i = rank - 2; i >= 0; --i) {
+            row_strides[i] = row_strides[i + 1] * static_cast<int64_t>(p_shape[i + 1]);
+        }
+
+        mlx::core::Shape view_shape;
+        mlx::core::Strides view_strides;
+        mlx::core::Shape r_grid_shape;
+        std::vector<int> win_axes;
+        int32_t o_prod = 1;
+        int32_t w_prod = 1;
+        for (int i = 0; i < rank; ++i) {
+            view_shape.push_back(source.shape(i));
+            view_strides.push_back(row_strides[i] * static_cast<int64_t>(win_strides[i]));
+            r_grid_shape.push_back(1);
+            o_prod *= source.shape(i);
+            if (win_dims[i] > 1) {
+                win_axes.push_back(static_cast<int>(view_shape.size()));
+                view_shape.push_back(win_dims[i]);
+                view_strides.push_back(row_strides[i]);
+                r_grid_shape.push_back(win_dims[i]);
+                w_prod *= win_dims[i];
+            }
+        }
+
+        mlx::core::array win_pos = mlx::core::zeros(mlx::core::Shape{o_prod}, mlx::core::int32);
+        if (!win_axes.empty()) {
+            mlx::core::array p_view = mlx::core::as_strided(p, view_shape, view_strides, 0);
+            mlx::core::array win_ext = is_max
+                ? mlx::core::max(p_view, win_axes, /*keepdims=*/true)
+                : mlx::core::min(p_view, win_axes, /*keepdims=*/true);
+            mlx::core::array r_grid = mlx::core::reshape(
+                mlx::core::arange(0, w_prod, mlx::core::int32),
+                r_grid_shape);
+            mlx::core::array cand_idx = mlx::core::where(
+                mlx::core::equal(p_view, win_ext),
+                r_grid,
+                mlx::core::array(w_prod, mlx::core::int32));
+            win_pos = mlx::core::reshape(
+                mlx::core::min(cand_idx, win_axes, /*keepdims=*/false),
+                mlx::core::Shape{o_prod});
+        }
+
+        std::vector<int32_t> win_offsets(w_prod, 0);
+        for (int32_t w = 0; w < w_prod; ++w) {
+            int32_t rem = w;
+            int32_t off = 0;
+            for (int i = rank - 1; i >= 0; --i) {
+                int32_t coord = rem % win_dims[i];
+                rem /= win_dims[i];
+                off += coord * static_cast<int32_t>(row_strides[i]);
+            }
+            win_offsets[w] = off;
+        }
+        mlx::core::array win_offsets_arr(win_offsets.data(), mlx::core::Shape{w_prod}, mlx::core::int32);
+        mlx::core::array win_flat_idx = mlx::core::take(win_offsets_arr, win_pos, 0);
+
+        mlx::core::array base_idx = mlx::core::array(0, mlx::core::int32);
+        for (int i = 0; i < rank; ++i) {
+            int32_t o_dim = source.shape(i);
+            int32_t step = static_cast<int32_t>(row_strides[i] * static_cast<int64_t>(win_strides[i]));
+            if (o_dim > 1 && step != 0) {
+                mlx::core::Shape b_shape(rank, 1);
+                b_shape[i] = o_dim;
+                mlx::core::array axis_off = mlx::core::reshape(
+                    mlx::core::arange(0, o_dim * step, step, mlx::core::int32),
+                    b_shape);
+                base_idx = (base_idx.ndim() == 0) ? axis_off : mlx::core::add(base_idx, axis_off);
+            }
+        }
+        if (base_idx.ndim() > 0) {
+            base_idx = mlx::core::reshape(
+                mlx::core::broadcast_to(base_idx, source.shape()),
+                mlx::core::Shape{o_prod});
+            win_flat_idx = mlx::core::add(base_idx, win_flat_idx);
+        }
+
+        mlx::core::array zeros_flat = mlx::core::zeros(mlx::core::Shape{pn}, operand.dtype());
+        mlx::core::array src_flat = mlx::core::reshape(source, mlx::core::Shape{o_prod});
+        mlx::core::array out_flat = (operand.dtype() == mlx::core::complex64)
+            ? evalBinaryOp(
+                  MLX_BINARY_COMPLEX,
+                  mlx::core::scatter_add_axis(mlx::core::real(zeros_flat), win_flat_idx, mlx::core::real(src_flat), 0),
+                  mlx::core::scatter_add_axis(mlx::core::imag(zeros_flat), win_flat_idx, mlx::core::imag(src_flat), 0))
+            : mlx::core::scatter_add_axis(zeros_flat, win_flat_idx, src_flat, 0);
+        out_padded = mlx::core::reshape(out_flat, p_shape);
     }
-    flat_win_shape[rank] = w_prod;
-
-    mlx::core::array p_win = mlx::core::reshape(
-        mlx::core::as_strided(p, view_shape, view_strides, 0),
-        flat_win_shape);
-
-    mlx::core::array idx = mlx::core::reshape(
-        mlx::core::arange(0, pn, mlx::core::int32),
-        p_shape);
-    mlx::core::array idx_win = mlx::core::reshape(
-        mlx::core::as_strided(idx, view_shape, view_strides, 0),
-        flat_win_shape);
-
-    mlx::core::array win_pos = is_max
-        ? mlx::core::argmax(p_win, rank, /*keepdims=*/true)
-        : mlx::core::argmin(p_win, rank, /*keepdims=*/true);
-
-    mlx::core::array win_flat_idx = mlx::core::reshape(
-        mlx::core::take_along_axis(idx_win, win_pos, rank),
-        mlx::core::Shape{o_prod});
-
-    mlx::core::array zeros_flat = mlx::core::zeros(mlx::core::Shape{pn}, operand.dtype());
-    mlx::core::array src_flat = mlx::core::reshape(source, mlx::core::Shape{o_prod, 1});
-    mlx::core::array out_flat = (operand.dtype() == mlx::core::complex64)
-        ? evalBinaryOp(
-              MLX_BINARY_COMPLEX,
-              mlx::core::scatter_add(mlx::core::real(zeros_flat), win_flat_idx, mlx::core::real(src_flat), 0),
-              mlx::core::scatter_add(mlx::core::imag(zeros_flat), win_flat_idx, mlx::core::imag(src_flat), 0))
-        : mlx::core::scatter_add(zeros_flat, win_flat_idx, src_flat, 0);
-    mlx::core::array out_padded = mlx::core::reshape(out_flat, p_shape);
 
     if (!pad_axes.empty()) {
         mlx::core::Shape slice_start(rank), slice_stop(rank);
@@ -1134,7 +1257,8 @@ struct MLXTape {
                     if (!a.flags().row_contiguous) {
                         a = mlx::core::contiguous(a);
                     }
-                    mlx::core::array s = mlx::core::as_strided(a, node.shape, node.strides, static_cast<size_t>(node.offset));
+                    mlx::core::array s = mlx::core::as_strided(
+                        a, node.shape, node.strides, static_cast<size_t>(node.offset));
                     if (!node.strides.empty() && node.strides.back() != 1) {
                         s = mlx::core::contiguous(s);
                     }
