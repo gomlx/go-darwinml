@@ -197,9 +197,12 @@ MPSGraphTensorHandle mpsgraph_argmin(MPSGraphContextHandle ctx, MPSGraphTensorHa
 MPSGraphTensorHandle mpsgraph_argmax(MPSGraphContextHandle ctx, MPSGraphTensorHandle x,
     int axis, int outputDtype, MPSGraphError* error);
 
-// --- Softmax ---
+// --- Softmax & SDPA ---
 MPSGraphTensorHandle mpsgraph_softmax(MPSGraphContextHandle ctx,
     MPSGraphTensorHandle x, int axis, MPSGraphError* error);
+MPSGraphTensorHandle mpsgraph_sdpa(MPSGraphContextHandle ctx,
+    MPSGraphTensorHandle q, MPSGraphTensorHandle k, MPSGraphTensorHandle v,
+    MPSGraphTensorHandle mask, float scale, MPSGraphError* error);
 
 // --- Random Number Generation ---
 MPSGraphTensorHandle mpsgraph_random_uniform(MPSGraphContextHandle ctx,
@@ -210,6 +213,17 @@ MPSGraphTensorHandle mpsgraph_random_uniform(MPSGraphContextHandle ctx,
 MPSGraphTensorHandle mpsgraph_pool2d(MPSGraphContextHandle ctx,
     MPSGraphTensorHandle x, int mode,
     int64_t* windowDims, int64_t* strides, int64_t* padBefore, int64_t* padAfter,
+    MPSGraphError* error);
+MPSGraphTensorHandle mpsgraph_pool4d(MPSGraphContextHandle ctx,
+    MPSGraphTensorHandle x, int mode,
+    int64_t* windowDims, int64_t* strides, int64_t* dilations,
+    int64_t* padBefore, int64_t* padAfter,
+    MPSGraphError* error);
+
+// --- Cumulative Operations ---
+// mode: 0=sum, 1=product, 2=max, 3=min
+MPSGraphTensorHandle mpsgraph_cumulative(MPSGraphContextHandle ctx,
+    MPSGraphTensorHandle x, int mode, int axis, bool exclusive, bool reverse,
     MPSGraphError* error);
 
 // --- Max Pool 2D Gradient (SelectAndScatter for MaxPool backprop) ---

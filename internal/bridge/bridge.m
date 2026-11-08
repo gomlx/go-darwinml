@@ -429,37 +429,17 @@ MPSGraphTensorHandle mpsgraph_transpose(MPSGraphContextHandle handle, MPSGraphTe
         MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
         MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
 
-        // Apply transposition by chaining pairwise swaps to achieve the target permutation.
-        // We build the permutation incrementally: for each position i, find where the target
-        // axis currently is and swap it into place.
-        int current[rank];
-        for (int i = 0; i < rank; i++) current[i] = i;
-
-        MPSGraphTensor* result = input;
-        for (int i = 0; i < rank; i++) {
-            int target = permutation[i];
-            if (current[i] == target) continue;
-
-            // Find where target currently is.
-            int j = -1;
-            for (int k = i; k < rank; k++) {
-                if (current[k] == target) { j = k; break; }
-            }
-            if (j < 0) {
-                setError(error, 31, @"invalid permutation in transpose");
-                return NULL;
-            }
-
-            result = [ctx.graph transposeTensor:result
-                                      dimension:(NSUInteger)i
-                                  withDimension:(NSUInteger)j
-                                           name:nil];
-            // Update tracking.
-            int tmp = current[i];
-            current[i] = current[j];
-            current[j] = tmp;
+        if (rank <= 1) {
+            return (__bridge void*)input;
         }
-
+        NSArray<NSNumber*>* permArr = intArray(permutation, rank);
+        MPSGraphTensor* result = [ctx.graph transposeTensor:input
+                                                permutation:permArr
+                                                       name:nil];
+        if (!result) {
+            setError(error, 31, @"transpose failed");
+            return NULL;
+        }
         return (__bridge void*)result;
     }
 }
@@ -594,36 +574,28 @@ MPSGraphTensorHandle mpsgraph_pad(MPSGraphContextHandle handle, MPSGraphTensorHa
             setError(error, 37, @"pad failed");
             return NULL;
         }
+        if (!fillTensor) {
+            return (__bridge void*)paddedInput;
+        }
 
-        // Step 2: Build a mask to identify padding positions.
-        // Create a ones tensor with the input shape, pad it with 0.0.
-        // Result: 1 where original data, 0 where padding.
-        MPSGraphTensor* ones = [ctx.graph constantWithScalar:1.0
-                                                       shape:input.shape
-                                                    dataType:input.dataType];
-        MPSGraphTensor* mask = [ctx.graph padTensor:ones
+        // Step 2: Build a boolean mask (true where original data, false where padding)
+        // and select between paddedInput and fillTensor. Using selectWithPredicateTensor
+        // avoids 0 * (±Inf) = NaN when fillTensor is ±Inf and works for all dtypes including Bool.
+        MPSGraphTensor* onesBool = [ctx.graph constantWithScalar:1.0
+                                                           shape:input.shape
+                                                        dataType:MPSDataTypeBool];
+        MPSGraphTensor* mask = [ctx.graph padTensor:onesBool
                                     withPaddingMode:mode
                                         leftPadding:leftPad
                                        rightPadding:rightPad
                                       constantValue:0.0
                                                name:nil];
-
-        // Step 3: Invert the mask: 1 where padding, 0 where data.
-        MPSGraphTensor* onesLike = [ctx.graph constantWithScalar:1.0
-                                                           shape:paddedInput.shape
-                                                        dataType:input.dataType];
-        MPSGraphTensor* invertedMask = [ctx.graph subtractionWithPrimaryTensor:onesLike
-                                                              secondaryTensor:mask
-                                                                         name:nil];
-
-        // Step 4: Multiply inverted mask by fillTensor (broadcast).
-        MPSGraphTensor* fillBroadcast = [ctx.graph multiplicationWithPrimaryTensor:invertedMask
-                                                                  secondaryTensor:fillTensor
-                                                                             name:nil];
-
-        // Step 5: Add to padded input.
-        MPSGraphTensor* result = [ctx.graph additionWithPrimaryTensor:paddedInput
-                                                     secondaryTensor:fillBroadcast
+        MPSGraphTensor* fillBroadcast = [ctx.graph broadcastTensor:fillTensor
+                                                           toShape:paddedInput.shape
+                                                              name:nil];
+        MPSGraphTensor* result = [ctx.graph selectWithPredicateTensor:mask
+                                                 truePredicateTensor:paddedInput
+                                                falsePredicateTensor:fillBroadcast
                                                                 name:nil];
         if (!result) {
             setError(error, 37, @"pad with fill value failed");
@@ -1159,8 +1131,10 @@ MPSGraphExecHandle mpsgraph_compile(MPSGraphContextHandle handle,
             [targetTensors addObject:(__bridge MPSGraphTensor*)targets[i]];
         }
 
-        // Compile.
+        // Compile for GPU (Level0 runs core GPU optimizations without attempting ANE placement,
+        // which avoids multi-second _ANECompiler failures on general compute graphs).
         MPSGraphCompilationDescriptor* compDesc = [[MPSGraphCompilationDescriptor alloc] init];
+        compDesc.optimizationLevel = MPSGraphOptimizationLevel0;
         MPSGraphExecutable* exec = nil;
         @try {
             exec = [ctx.graph compileWithDevice:[MPSGraphDevice deviceWithMTLDevice:ctx.device]
@@ -1524,6 +1498,43 @@ MPSGraphTensorHandle mpsgraph_softmax(MPSGraphContextHandle handle, MPSGraphTens
     }
 }
 
+MPSGraphTensorHandle mpsgraph_sdpa(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle qH, MPSGraphTensorHandle kH, MPSGraphTensorHandle vH,
+    MPSGraphTensorHandle maskH, float scale, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        if (@available(macOS 15.0, *)) {
+            MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+            MPSGraphTensor* q = (__bridge MPSGraphTensor*)qH;
+            MPSGraphTensor* k = (__bridge MPSGraphTensor*)kH;
+            MPSGraphTensor* v = (__bridge MPSGraphTensor*)vH;
+            MPSGraphTensor* m = maskH ? (__bridge MPSGraphTensor*)maskH : nil;
+            MPSGraphTensor* result = nil;
+            if (m) {
+                result = [ctx.graph scaledDotProductAttentionWithQueryTensor:q
+                                                                   keyTensor:k
+                                                                 valueTensor:v
+                                                                  maskTensor:m
+                                                                       scale:scale
+                                                                        name:nil];
+            } else {
+                result = [ctx.graph scaledDotProductAttentionWithQueryTensor:q
+                                                                   keyTensor:k
+                                                                 valueTensor:v
+                                                                       scale:scale
+                                                                        name:nil];
+            }
+            if (!result) {
+                setError(error, 205, @"scaledDotProductAttention failed");
+                return NULL;
+            }
+            return (__bridge void*)result;
+        }
+        setError(error, 206, @"scaledDotProductAttention requires macOS 15.0+");
+        return NULL;
+    }
+}
+
 // ===========================================================================
 // Random Number Generation
 // ===========================================================================
@@ -1590,6 +1601,101 @@ MPSGraphTensorHandle mpsgraph_pool2d(MPSGraphContextHandle handle, MPSGraphTenso
         }
         if (!result) {
             setError(error, 221, @"pooling failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+MPSGraphTensorHandle mpsgraph_pool4d(MPSGraphContextHandle handle, MPSGraphTensorHandle x,
+    int mode, int64_t* windowDims, int64_t* strides, int64_t* dilations,
+    int64_t* padBefore, int64_t* padAfter,
+    MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+
+        NSArray<NSNumber*>* kernelSizes = @[
+            @(windowDims[0]), @(windowDims[1]), @(windowDims[2]), @(windowDims[3])
+        ];
+        NSArray<NSNumber*>* strideArr = @[
+            @(strides[0]), @(strides[1]), @(strides[2]), @(strides[3])
+        ];
+        NSArray<NSNumber*>* dilationArr = @[
+            @(dilations[0]), @(dilations[1]), @(dilations[2]), @(dilations[3])
+        ];
+        NSArray<NSNumber*>* padArr = @[
+            @(padBefore[0]), @(padAfter[0]),
+            @(padBefore[1]), @(padAfter[1]),
+            @(padBefore[2]), @(padAfter[2]),
+            @(padBefore[3]), @(padAfter[3])
+        ];
+
+        MPSGraphPooling4DOpDescriptor* desc = [MPSGraphPooling4DOpDescriptor
+            descriptorWithKernelSizes:kernelSizes
+                              strides:strideArr
+                        dilationRates:dilationArr
+                        paddingValues:padArr
+                         paddingStyle:MPSGraphPaddingStyleExplicit];
+        if (mode == 1) {
+            desc.includeZeroPadToAverage = YES;
+        }
+
+        MPSGraphTensor* result = nil;
+        switch (mode) {
+            case 0: // Max pooling
+                result = [ctx.graph maxPooling4DWithSourceTensor:input descriptor:desc name:nil];
+                break;
+            case 1: // Average pooling
+                result = [ctx.graph avgPooling4DWithSourceTensor:input descriptor:desc name:nil];
+                break;
+            default:
+                setError(error, 222, @"unsupported 4D pooling mode");
+                return NULL;
+        }
+        if (!result) {
+            setError(error, 223, @"4D pooling failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+// ===========================================================================
+// Cumulative Operations
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_cumulative(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle x, int mode, int axis, bool exclusive, bool reverse,
+    MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        BOOL ex = exclusive ? YES : NO;
+        BOOL rev = reverse ? YES : NO;
+
+        MPSGraphTensor* result = nil;
+        switch (mode) {
+            case 0: // Sum
+                result = [ctx.graph cumulativeSumWithTensor:input axis:axis exclusive:ex reverse:rev name:nil];
+                break;
+            case 1: // Product
+                result = [ctx.graph cumulativeProductWithTensor:input axis:axis exclusive:ex reverse:rev name:nil];
+                break;
+            case 2: // Max
+                result = [ctx.graph cumulativeMaximumWithTensor:input axis:axis exclusive:ex reverse:rev name:nil];
+                break;
+            case 3: // Min
+                result = [ctx.graph cumulativeMinimumWithTensor:input axis:axis exclusive:ex reverse:rev name:nil];
+                break;
+            default:
+                setError(error, 250, @"unsupported cumulative mode");
+                return NULL;
+        }
+        if (!result) {
+            setError(error, 251, @"cumulative op failed");
             return NULL;
         }
         return (__bridge void*)result;

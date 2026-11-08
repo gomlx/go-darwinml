@@ -12,6 +12,8 @@ import (
 
 	"github.com/gomlx/compute"
 	"github.com/gomlx/compute/dtypes"
+	"github.com/gomlx/compute/dtypes/bfloat16"
+	"github.com/gomlx/compute/dtypes/float16"
 	"github.com/gomlx/compute/notimplemented"
 	"github.com/gomlx/compute/shapeinference"
 	"github.com/gomlx/compute/shapes"
@@ -1289,6 +1291,93 @@ func (f *Function) ArgMinMax(x compute.Value, axis int, outputDType dtypes.DType
 }
 
 // ===========================================================================
+// Cumulative Operations (CumSum, CumMax)
+// ===========================================================================
+
+func (f *Function) cumulativeOp(opName string, mode int, operand compute.Value, axis int, options compute.CumSumOptions) (compute.Value, error) {
+	node, err := f.resolveNode(operand)
+	if err != nil {
+		return nil, errors.Wrap(err, opName)
+	}
+	if axis < 0 {
+		axis += node.shape.Rank()
+	}
+	var outShape shapes.Shape
+	if mode == bridge.CumulativeSum {
+		outShape, err = shapeinference.CumSum(node.shape, axis)
+	} else {
+		outShape, err = shapeinference.CumMax(node.shape, axis)
+	}
+	if err != nil {
+		return nil, errors.Wrap(err, opName)
+	}
+	if outShape.Size() == 0 {
+		return &graphNode{tensor: nil, shape: outShape, owner: f}, nil
+	}
+
+	// MPSGraph's cumulativeMaximumWithTensor initializes exclusive float scans with -FLT_MAX
+	// rather than -Inf. Handle exclusive float CumMax by running inclusive CumMax on the N-1
+	// prefix/suffix and padding the initial element with -Inf.
+	if mode == bridge.CumulativeMax && options.Exclusive && node.shape.DType.IsFloat() {
+		negInf, err := f.makeScalarConst(math.Inf(-1), node.shape.DType)
+		if err != nil {
+			return nil, errors.Wrap(err, opName)
+		}
+		axisLen := node.shape.Dimensions[axis]
+		if axisLen == 1 {
+			tensor, err := f.ctx().BroadcastTo(negInf, toInt64Slice(outShape.Dimensions))
+			if err != nil {
+				return nil, errors.Wrap(err, opName)
+			}
+			return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
+		}
+		rank := node.shape.Rank()
+		starts := make([]int64, rank)
+		ends := toInt64Slice(node.shape.Dimensions)
+		strides := make([]int64, rank)
+		for i := range rank {
+			strides[i] = 1
+		}
+		padBefore := make([]int64, rank)
+		padAfter := make([]int64, rank)
+		if options.Reverse {
+			starts[axis] = 1
+			padAfter[axis] = 1
+		} else {
+			ends[axis] = int64(axisLen - 1)
+			padBefore[axis] = 1
+		}
+		sliced, err := f.ctx().Slice(node.tensor, starts, ends, strides)
+		if err != nil {
+			return nil, errors.Wrap(err, opName)
+		}
+		cum, err := f.ctx().Cumulative(sliced, mode, axis, false, options.Reverse)
+		if err != nil {
+			return nil, errors.Wrap(err, opName)
+		}
+		tensor, err := f.ctx().Pad(cum, negInf, padBefore, padAfter)
+		if err != nil {
+			return nil, errors.Wrap(err, opName)
+		}
+		return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
+	}
+
+	tensor, err := f.ctx().Cumulative(node.tensor, mode, axis, options.Exclusive, options.Reverse)
+	if err != nil {
+		return nil, errors.Wrap(err, opName)
+	}
+	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
+}
+
+func (f *Function) CumSum(operand compute.Value, axis int, options compute.CumSumOptions) (compute.Value, error) {
+	return f.cumulativeOp("CumSum", bridge.CumulativeSum, operand, axis, options)
+}
+
+func (f *Function) CumMax(operand compute.Value, axis int, options compute.CumSumOptions) (compute.Value, error) {
+	return f.cumulativeOp("CumMax", bridge.CumulativeMax, operand, axis, options)
+}
+
+// ===========================================================================
 // Batch Normalization
 // ===========================================================================
 
@@ -1669,7 +1758,33 @@ func (f *Function) Pad(operand, fillValue compute.Value, axesConfig ...compute.P
 		}
 	}
 
-	// Step 2: Handle negative Start / End padding (cropping) via Slice.
+	// Step 2: Handle positive Start / End padding via Pad first so cropping
+	// never produces a zero-sized intermediate tensor when all input elements
+	// on an axis are cropped out.
+	hasPad := false
+	padBefore := make([]int64, rank)
+	padAfter := make([]int64, rank)
+	for i, ac := range axesConfig {
+		if ac.Start > 0 {
+			padBefore[i] = int64(ac.Start)
+			hasPad = true
+		}
+		if ac.End > 0 {
+			padAfter[i] = int64(ac.End)
+			hasPad = true
+		}
+	}
+	if hasPad {
+		tensor, err = f.ctx().Pad(tensor, fillNode.tensor, padBefore, padAfter)
+		if err != nil {
+			return nil, errors.Wrap(err, "Pad")
+		}
+		for i := range rank {
+			currentShape[i] += padBefore[i] + padAfter[i]
+		}
+	}
+
+	// Step 3: Handle negative Start / End padding (cropping) via Slice.
 	hasCrop := false
 	cropStarts := make([]int64, rank)
 	cropEnds := make([]int64, rank)
@@ -1690,30 +1805,6 @@ func (f *Function) Pad(operand, fillValue compute.Value, axesConfig ...compute.P
 		tensor, err = f.ctx().Slice(tensor, cropStarts, cropEnds, cropStrides)
 		if err != nil {
 			return nil, errors.Wrap(err, "Pad: negative padding slice")
-		}
-		for i := range rank {
-			currentShape[i] = cropEnds[i] - cropStarts[i]
-		}
-	}
-
-	// Step 3: Handle positive Start / End padding via Pad.
-	hasPad := false
-	padBefore := make([]int64, rank)
-	padAfter := make([]int64, rank)
-	for i, ac := range axesConfig {
-		if ac.Start > 0 {
-			padBefore[i] = int64(ac.Start)
-			hasPad = true
-		}
-		if ac.End > 0 {
-			padAfter[i] = int64(ac.End)
-			hasPad = true
-		}
-	}
-	if hasPad {
-		tensor, err = f.ctx().Pad(tensor, fillNode.tensor, padBefore, padAfter)
-		if err != nil {
-			return nil, errors.Wrap(err, "Pad")
 		}
 	}
 
@@ -2160,12 +2251,7 @@ func (f *Function) dilateAxis(tensor bridge.Tensor, axis int, axisSize, dilation
 	padAfter := make([]int64, rank+1)
 	padAfter[axis+1] = dilation - 1
 
-	zeroTensor, err := f.makeScalarConst(0, dtype)
-	if err != nil {
-		return nil, err
-	}
-
-	result, err = f.ctx().Pad(result, zeroTensor, padBefore, padAfter)
+	result, err = f.ctx().Pad(result, nil, padBefore, padAfter)
 	if err != nil {
 		return nil, err
 	}
@@ -2299,8 +2385,17 @@ func detectPoolAxes(windowDimensions, windowStrides []int, paddings [][2]int) (p
 		}
 	}
 
+	if len(spatialAxes) > 2 {
+		return info, errors.Errorf("expected at most 2 spatial axes (window > 1), got %d spatial %v, %d non-spatial %v",
+			len(spatialAxes), spatialAxes, len(nonSpatialAxes), nonSpatialAxes)
+	}
+	for len(spatialAxes) < 2 && len(nonSpatialAxes) > 0 {
+		lastIdx := len(nonSpatialAxes) - 1
+		spatialAxes = append([]int{nonSpatialAxes[lastIdx]}, spatialAxes...)
+		nonSpatialAxes = nonSpatialAxes[:lastIdx]
+	}
 	if len(spatialAxes) != 2 || len(nonSpatialAxes) != 2 {
-		return info, errors.Errorf("expected exactly 2 spatial axes (window > 1), got %d spatial %v, %d non-spatial %v",
+		return info, errors.Errorf("expected 4 axes total, got %d spatial %v, %d non-spatial %v",
 			len(spatialAxes), spatialAxes, len(nonSpatialAxes), nonSpatialAxes)
 	}
 
@@ -2331,105 +2426,381 @@ func detectPoolAxes(windowDimensions, windowStrides []int, paddings [][2]int) (p
 	return info, nil
 }
 
+// makeScalarConstNode creates a scalar constant *graphNode of the given dtype.
+func (f *Function) makeScalarConstNode(val float64, dt dtypes.DType) (*graphNode, error) {
+	var v compute.Value
+	var err error
+	switch dt {
+	case dtypes.Float32:
+		v, err = f.Constant([]float32{float32(val)})
+	case dtypes.Float16:
+		v, err = f.Constant([]float16.Float16{float16.FromFloat32(float32(val))})
+	case dtypes.BFloat16:
+		v, err = f.Constant([]bfloat16.BFloat16{bfloat16.FromFloat32(float32(val))})
+	case dtypes.Int8:
+		v, err = f.Constant([]int8{int8(val)})
+	case dtypes.Int16:
+		v, err = f.Constant([]int16{int16(val)})
+	case dtypes.Int32:
+		v, err = f.Constant([]int32{int32(val)})
+	case dtypes.Int64:
+		v, err = f.Constant([]int64{int64(val)})
+	case dtypes.Uint8:
+		v, err = f.Constant([]uint8{uint8(val)})
+	case dtypes.Uint16:
+		v, err = f.Constant([]uint16{uint16(val)})
+	case dtypes.Uint32:
+		v, err = f.Constant([]uint32{uint32(val)})
+	case dtypes.Uint64:
+		v, err = f.Constant([]uint64{uint64(val)})
+	case dtypes.Bool:
+		v, err = f.Constant([]bool{val != 0})
+	default:
+		return nil, errors.Wrapf(compute.ErrNotImplemented, "makeScalarConstNode: unsupported dtype %s", dt)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return v.(*graphNode), nil
+}
+
+// makeReduceIdentityConst returns the scalar identity element for the given reduction type and dtype.
+func (f *Function) makeReduceIdentityConst(reductionType compute.ReduceOpType, dt dtypes.DType) (*graphNode, error) {
+	switch reductionType {
+	case compute.ReduceOpSum:
+		return f.makeScalarConstNode(0, dt)
+	case compute.ReduceOpProduct:
+		return f.makeScalarConstNode(1, dt)
+	case compute.ReduceOpMax:
+		switch dt {
+		case dtypes.Float32, dtypes.Float16, dtypes.BFloat16:
+			return f.makeScalarConstNode(math.Inf(-1), dt)
+		case dtypes.Int8:
+			return f.makeScalarConstNode(float64(math.MinInt8), dt)
+		case dtypes.Int16:
+			return f.makeScalarConstNode(float64(math.MinInt16), dt)
+		case dtypes.Int32:
+			return f.makeScalarConstNode(float64(math.MinInt32), dt)
+		case dtypes.Int64:
+			v, err := f.Constant([]int64{math.MinInt64})
+			if err != nil {
+				return nil, err
+			}
+			return v.(*graphNode), nil
+		case dtypes.Uint8, dtypes.Uint16, dtypes.Uint32, dtypes.Uint64, dtypes.Bool:
+			return f.makeScalarConstNode(0, dt)
+		default:
+			return nil, errors.Wrapf(compute.ErrNotImplemented, "ReduceWindow: Max not supported for dtype %s", dt)
+		}
+	case compute.ReduceOpMin:
+		switch dt {
+		case dtypes.Float32, dtypes.Float16, dtypes.BFloat16:
+			return f.makeScalarConstNode(math.Inf(1), dt)
+		case dtypes.Int8:
+			return f.makeScalarConstNode(float64(math.MaxInt8), dt)
+		case dtypes.Int16:
+			return f.makeScalarConstNode(float64(math.MaxInt16), dt)
+		case dtypes.Int32:
+			return f.makeScalarConstNode(float64(math.MaxInt32), dt)
+		case dtypes.Int64:
+			v, err := f.Constant([]int64{math.MaxInt64})
+			if err != nil {
+				return nil, err
+			}
+			return v.(*graphNode), nil
+		case dtypes.Uint8:
+			return f.makeScalarConstNode(float64(math.MaxUint8), dt)
+		case dtypes.Uint16:
+			return f.makeScalarConstNode(float64(math.MaxUint16), dt)
+		case dtypes.Uint32:
+			return f.makeScalarConstNode(float64(math.MaxUint32), dt)
+		case dtypes.Uint64:
+			v, err := f.Constant([]uint64{math.MaxUint64})
+			if err != nil {
+				return nil, err
+			}
+			return v.(*graphNode), nil
+		case dtypes.Bool:
+			return f.makeScalarConstNode(1, dt)
+		default:
+			return nil, errors.Wrapf(compute.ErrNotImplemented, "ReduceWindow: Min not supported for dtype %s", dt)
+		}
+	default:
+		return nil, errors.Wrapf(compute.ErrNotImplemented, "ReduceWindow: reduction type %v not supported in %q backend", reductionType, BackendName)
+	}
+}
+
 func (f *Function) ReduceWindow(
 	x compute.Value,
 	reductionType compute.ReduceOpType,
 	windowDimensions, strides, baseDilations, windowDilations []int,
 	paddings [][2]int,
 ) (compute.Value, error) {
-	node, err := f.resolveNode(x)
+	opNode, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, "ReduceWindow")
 	}
 
 	outShape, err := shapeinference.ReduceWindow(
-		node.shape, windowDimensions, strides, baseDilations, windowDilations, paddings)
+		opNode.shape, windowDimensions, strides, baseDilations, windowDilations, paddings)
 	if err != nil {
 		return nil, errors.Wrap(err, "ReduceWindow")
 	}
 
-	rank := node.shape.Rank()
-	if rank != 4 {
-		return nil, errors.Wrapf(compute.ErrNotImplemented, "ReduceWindow: only 4D tensors supported in %q backend, got rank %d", BackendName, rank)
+	rank := opNode.shape.Rank()
+	if rank == 0 {
+		return f.Identity(opNode)
+	}
+	if outShape.Size() == 0 {
+		return &graphNode{tensor: nil, shape: outShape, owner: f}, nil
 	}
 
-	// Validate dilations (not supported by MPSGraph pooling).
-	for _, d := range baseDilations {
-		if d > 1 {
-			return nil, errors.Wrapf(compute.ErrNotImplemented, "ReduceWindow: baseDilations > 1 not supported in %q backend", BackendName)
-		}
-	}
-	for _, d := range windowDilations {
-		if d > 1 {
-			return nil, errors.Wrapf(compute.ErrNotImplemented, "ReduceWindow: windowDilations > 1 not supported in %q backend", BackendName)
-		}
-	}
-
-	var mode int
-	isSum := false
+	var mpsReduceOp int
 	switch reductionType {
-	case compute.ReduceOpMax:
-		mode = 0
 	case compute.ReduceOpSum:
-		mode = 1 // MPSGraph has avg pooling (mode 1); we'll multiply by window area to get sum.
-		isSum = true
+		mpsReduceOp = bridge.ReduceSum
+	case compute.ReduceOpProduct:
+		mpsReduceOp = bridge.ReduceProduct
+	case compute.ReduceOpMax:
+		mpsReduceOp = bridge.ReduceMax
+	case compute.ReduceOpMin:
+		mpsReduceOp = bridge.ReduceMin
 	default:
 		return nil, errors.Wrapf(compute.ErrNotImplemented, "ReduceWindow: reduction type %v not supported in %q backend", reductionType, BackendName)
 	}
 
-	axesInfo, err := detectPoolAxes(windowDimensions, strides, paddings)
-	if err != nil {
-		return nil, errors.Wrap(compute.ErrNotImplemented, err.Error())
-	}
-
-	// Transpose to NCHW if needed.
-	tensor := node.tensor
-	if axesInfo.needsTranspose {
-		tensor, err = f.ctx().Transpose(tensor, axesInfo.toNCHW)
-		if err != nil {
-			return nil, errors.Wrap(err, "ReduceWindow: transpose to NCHW")
+	winDims := make([]int, rank)
+	winStrides := make([]int, rank)
+	baseDil := make([]int, rank)
+	winDil := make([]int, rank)
+	for i := range rank {
+		if len(windowDimensions) > 0 {
+			winDims[i] = windowDimensions[i]
+		} else {
+			winDims[i] = 1
+		}
+		if len(strides) > 0 {
+			winStrides[i] = strides[i]
+		} else {
+			winStrides[i] = winDims[i]
+		}
+		if len(baseDilations) > 0 {
+			baseDil[i] = baseDilations[i]
+		} else {
+			baseDil[i] = 1
+		}
+		if len(windowDilations) > 0 {
+			winDil[i] = windowDilations[i]
+		} else {
+			winDil[i] = 1
 		}
 	}
 
-	spatialWindow := axesInfo.spatialWindow[:]
-	spatialStrides := axesInfo.spatialStrides[:]
-	padBefore := axesInfo.padBefore[:]
-	padAfter := axesInfo.padAfter[:]
-
-	tensor, err = f.ctx().Pool2D(tensor, mode, spatialWindow, spatialStrides, padBefore, padAfter)
-	if err != nil {
-		return nil, errors.Wrap(err, "ReduceWindow")
-	}
-
-	// For sum pooling, convert avg to sum by multiplying by window area.
-	if isSum {
-		windowArea := float64(axesInfo.spatialWindow[0] * axesInfo.spatialWindow[1])
-		areaTensor, err := f.makeScalarConst(windowArea, node.shape.DType)
-		if err != nil {
-			return nil, errors.Wrap(err, "ReduceWindow: window area constant")
+	// Step 1: Apply baseDilations and paddings via f.Pad if needed.
+	needsPad := false
+	padConfig := make([]compute.PadAxis, rank)
+	for i := range rank {
+		padConfig[i].Interior = baseDil[i] - 1
+		if paddings != nil && i < len(paddings) {
+			padConfig[i].Start = paddings[i][0]
+			padConfig[i].End = paddings[i][1]
 		}
-		tensor, err = f.ctx().Mul(tensor, areaTensor)
-		if err != nil {
-			return nil, errors.Wrap(err, "ReduceWindow: sum = avg * window_area")
+		if padConfig[i].Start != 0 || padConfig[i].End != 0 || padConfig[i].Interior != 0 {
+			needsPad = true
 		}
 	}
 
-	// Transpose back from NCHW if needed.
-	if axesInfo.needsTranspose {
-		tensor, err = f.ctx().Transpose(tensor, axesInfo.fromNCHW)
+	paddedNode := opNode
+	if needsPad {
+		idConst, err := f.makeReduceIdentityConst(reductionType, opNode.shape.DType)
 		if err != nil {
-			return nil, errors.Wrap(err, "ReduceWindow: transpose from NCHW")
+			return nil, errors.Wrap(err, "ReduceWindow: identity constant")
+		}
+		paddedVal, err := f.Pad(opNode, idConst, padConfig...)
+		if err != nil {
+			return nil, errors.Wrap(err, "ReduceWindow: pad")
+		}
+		paddedNode = paddedVal.(*graphNode)
+	}
+
+	pDims := paddedNode.shape.Dimensions
+
+	// Step 2: Fast path for non-overlapping windows with unit window dilation:
+	// Reshape each active window axis (O_i * W_i) -> (O_i, W_i) followed by Reduce.
+	nonOverlapping := true
+	needsSlice := false
+	coveredDims := make([]int64, rank)
+	for i := range rank {
+		if winStrides[i] != winDims[i] || winDil[i] != 1 {
+			nonOverlapping = false
+			break
+		}
+		cov := outShape.Dimensions[i] * winDims[i]
+		if cov > pDims[i] {
+			nonOverlapping = false
+			break
+		}
+		coveredDims[i] = int64(cov)
+		if cov < pDims[i] {
+			needsSlice = true
 		}
 	}
 
-	// Reshape to match expected output shape if needed.
-	outDims := toInt64Slice(outShape.Dimensions)
-	tensor, err = f.ctx().Reshape(tensor, outDims)
-	if err != nil {
-		return nil, errors.Wrap(err, "ReduceWindow: reshape")
+	if nonOverlapping {
+		curTensor := paddedNode.tensor
+		if needsSlice {
+			starts := make([]int64, rank)
+			stridesOnes := make([]int64, rank)
+			for i := range rank {
+				stridesOnes[i] = 1
+			}
+			curTensor, err = f.ctx().Slice(curTensor, starts, coveredDims, stridesOnes)
+			if err != nil {
+				return nil, errors.Wrap(err, "ReduceWindow: slice covered")
+			}
+		}
+		splitShape := make([]int64, 0, 2*rank)
+		reduceAxes := make([]int, 0, rank)
+		for i := range rank {
+			splitShape = append(splitShape, int64(outShape.Dimensions[i]))
+			if winDims[i] > 1 {
+				reduceAxes = append(reduceAxes, len(splitShape))
+				splitShape = append(splitShape, int64(winDims[i]))
+			}
+		}
+		if len(reduceAxes) == 0 {
+			return &graphNode{tensor: curTensor, shape: outShape, owner: f}, nil
+		}
+		reshapedTensor, err := f.ctx().Reshape(curTensor, splitShape)
+		if err != nil {
+			return nil, errors.Wrap(err, "ReduceWindow: reshape")
+		}
+		redTensor, err := f.ctx().Reduce(reshapedTensor, mpsReduceOp, reduceAxes)
+		if err != nil {
+			return nil, errors.Wrap(err, "ReduceWindow: reduce")
+		}
+		outDims := toInt64Slice(outShape.Dimensions)
+		redTensor, err = f.ctx().Reshape(redTensor, outDims)
+		if err != nil {
+			return nil, errors.Wrap(err, "ReduceWindow: reshape output")
+		}
+		return &graphNode{tensor: redTensor, shape: outShape, owner: f}, nil
 	}
 
-	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
+	// Step 3: Native MPSGraph 4D pooling for floating-point Max, Min, Sum with rank <= 4.
+	dt := opNode.shape.DType
+	if rank <= 4 && dt.IsFloat() && (reductionType == compute.ReduceOpMax || reductionType == compute.ReduceOpMin || reductionType == compute.ReduceOpSum) {
+		offset := 4 - rank
+		shape4D := []int64{1, 1, 1, 1}
+		win4D := []int64{1, 1, 1, 1}
+		stride4D := []int64{1, 1, 1, 1}
+		dil4D := []int64{1, 1, 1, 1}
+		zeroPad4D := []int64{0, 0, 0, 0}
+		windowVol := int64(1)
+		for i := range rank {
+			shape4D[offset+i] = int64(pDims[i])
+			win4D[offset+i] = int64(winDims[i])
+			stride4D[offset+i] = int64(winStrides[i])
+			dil4D[offset+i] = int64(winDil[i])
+			windowVol *= int64(winDims[i])
+		}
+		tensor := paddedNode.tensor
+		if rank < 4 {
+			tensor, err = f.ctx().Reshape(tensor, shape4D)
+			if err != nil {
+				return nil, errors.Wrap(err, "ReduceWindow: reshape to 4D")
+			}
+		}
+		switch reductionType {
+		case compute.ReduceOpMax:
+			tensor, err = f.ctx().Pool4D(tensor, 0, win4D, stride4D, dil4D, zeroPad4D, zeroPad4D)
+			if err != nil {
+				return nil, errors.Wrap(err, "ReduceWindow: Pool4D max")
+			}
+		case compute.ReduceOpMin:
+			tensor, err = f.ctx().Neg(tensor)
+			if err != nil {
+				return nil, errors.Wrap(err, "ReduceWindow: neg before Pool4D min")
+			}
+			tensor, err = f.ctx().Pool4D(tensor, 0, win4D, stride4D, dil4D, zeroPad4D, zeroPad4D)
+			if err != nil {
+				return nil, errors.Wrap(err, "ReduceWindow: Pool4D min")
+			}
+			tensor, err = f.ctx().Neg(tensor)
+			if err != nil {
+				return nil, errors.Wrap(err, "ReduceWindow: neg after Pool4D min")
+			}
+		case compute.ReduceOpSum:
+			tensor, err = f.ctx().Pool4D(tensor, 1, win4D, stride4D, dil4D, zeroPad4D, zeroPad4D)
+			if err != nil {
+				return nil, errors.Wrap(err, "ReduceWindow: Pool4D avg")
+			}
+			volTensor, err := f.makeScalarConst(float64(windowVol), dt)
+			if err != nil {
+				return nil, errors.Wrap(err, "ReduceWindow: window volume constant")
+			}
+			tensor, err = f.ctx().Mul(tensor, volTensor)
+			if err != nil {
+				return nil, errors.Wrap(err, "ReduceWindow: sum = avg * window_vol")
+			}
+		}
+		outDims := toInt64Slice(outShape.Dimensions)
+		tensor, err = f.ctx().Reshape(tensor, outDims)
+		if err != nil {
+			return nil, errors.Wrap(err, "ReduceWindow: reshape from 4D")
+		}
+		return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
+	}
+
+	// Step 4: General fallback for integer dtypes, ReduceOpProduct, or rank > 4:
+	// accumulate strided slices across the window positions.
+	windowVol := 1
+	for _, w := range winDims {
+		windowVol *= w
+	}
+	if windowVol > 256 {
+		return nil, errors.Wrapf(compute.ErrNotImplemented,
+			"ReduceWindow: window volume %d for dtype %s / op %v exceeds fallback limit in %q backend",
+			windowVol, dt, reductionType, BackendName)
+	}
+
+	var accTensor bridge.Tensor
+	coords := make([]int, rank)
+	starts := make([]int64, rank)
+	ends := make([]int64, rank)
+	strides64 := toInt64Slice(winStrides)
+	for step := range windowVol {
+		rem := step
+		for i := rank - 1; i >= 0; i-- {
+			coords[i] = rem % winDims[i]
+			rem /= winDims[i]
+			starts[i] = int64(coords[i] * winDil[i])
+			ends[i] = starts[i] + int64(outShape.Dimensions[i]-1)*int64(winStrides[i]) + 1
+		}
+		sliceTensor, err := f.ctx().Slice(paddedNode.tensor, starts, ends, strides64)
+		if err != nil {
+			return nil, errors.Wrap(err, "ReduceWindow: window slice")
+		}
+		if step == 0 {
+			accTensor = sliceTensor
+			continue
+		}
+		switch reductionType {
+		case compute.ReduceOpSum:
+			accTensor, err = f.ctx().Add(accTensor, sliceTensor)
+		case compute.ReduceOpProduct:
+			accTensor, err = f.ctx().Mul(accTensor, sliceTensor)
+		case compute.ReduceOpMax:
+			accTensor, err = f.ctx().Max(accTensor, sliceTensor)
+		case compute.ReduceOpMin:
+			accTensor, err = f.ctx().Min(accTensor, sliceTensor)
+		}
+		if err != nil {
+			return nil, errors.Wrap(err, "ReduceWindow: window accumulate")
+		}
+	}
+
+	return &graphNode{tensor: accTensor, shape: outShape, owner: f}, nil
 }
 
 // ===========================================================================
@@ -2441,7 +2812,11 @@ func (f *Function) SelectAndScatterMax(operand, source compute.Value, windowDime
 }
 
 func (f *Function) SelectAndScatterMin(operand, source compute.Value, windowDimensions, windowStrides []int, paddings [][2]int) (compute.Value, error) {
-	return nil, errors.Wrapf(compute.ErrNotImplemented, "SelectAndScatterMin not supported in %q backend", BackendName)
+	negOperand, err := f.Neg(operand)
+	if err != nil {
+		return nil, errors.Wrap(err, "SelectAndScatterMin: negate operand")
+	}
+	return f.selectAndScatterImpl("SelectAndScatterMin", negOperand, source, windowDimensions, windowStrides, paddings)
 }
 
 func (f *Function) selectAndScatterImpl(opName string, operand, source compute.Value, windowDimensions, windowStrides []int, paddings [][2]int) (compute.Value, error) {
@@ -2455,18 +2830,54 @@ func (f *Function) selectAndScatterImpl(opName string, operand, source compute.V
 	}
 
 	rank := opNode.shape.Rank()
-	if rank != 4 {
-		return nil, errors.Wrapf(compute.ErrNotImplemented, "%s: only 4D tensors supported in %q backend, got rank %d", opName, BackendName, rank)
+	if rank < 1 || rank > 4 {
+		return nil, errors.Wrapf(compute.ErrNotImplemented, "%s: only 1D..4D tensors supported in %q backend, got rank %d", opName, BackendName, rank)
 	}
 
-	axesInfo, err := detectPoolAxes(windowDimensions, windowStrides, paddings)
+	offset := 4 - rank
+	win4 := []int{1, 1, 1, 1}
+	stride4 := []int{1, 1, 1, 1}
+	var pad4 [][2]int
+	if paddings != nil {
+		pad4 = make([][2]int, 4)
+	}
+	opDims4 := []int64{1, 1, 1, 1}
+	srcDims4 := []int64{1, 1, 1, 1}
+	for i := range rank {
+		opDims4[offset+i] = int64(opNode.shape.Dimensions[i])
+		srcDims4[offset+i] = int64(srcNode.shape.Dimensions[i])
+		if i < len(windowDimensions) {
+			win4[offset+i] = windowDimensions[i]
+		}
+		if windowStrides != nil && i < len(windowStrides) {
+			stride4[offset+i] = windowStrides[i]
+		} else {
+			stride4[offset+i] = win4[offset+i]
+		}
+		if paddings != nil && i < len(paddings) {
+			pad4[offset+i] = paddings[i]
+		}
+	}
+
+	axesInfo, err := detectPoolAxes(win4, stride4, pad4)
 	if err != nil {
 		return nil, errors.Wrapf(compute.ErrNotImplemented, "%s: %v", opName, err)
 	}
 
-	// Transpose operand and source to NCHW if needed.
 	opTensor := opNode.tensor
 	srcTensor := srcNode.tensor
+	if rank < 4 {
+		opTensor, err = f.ctx().Reshape(opTensor, opDims4)
+		if err != nil {
+			return nil, errors.Wrapf(err, "%s: reshape operand to 4D", opName)
+		}
+		srcTensor, err = f.ctx().Reshape(srcTensor, srcDims4)
+		if err != nil {
+			return nil, errors.Wrapf(err, "%s: reshape source to 4D", opName)
+		}
+	}
+
+	// Transpose operand and source to NCHW if needed.
 	if axesInfo.needsTranspose {
 		opTensor, err = f.ctx().Transpose(opTensor, axesInfo.toNCHW)
 		if err != nil {
@@ -2496,6 +2907,12 @@ func (f *Function) selectAndScatterImpl(opName string, operand, source compute.V
 		tensor, err = f.ctx().Transpose(tensor, axesInfo.fromNCHW)
 		if err != nil {
 			return nil, errors.Wrapf(err, "%s: transpose from NCHW", opName)
+		}
+	}
+	if rank < 4 {
+		tensor, err = f.ctx().Reshape(tensor, toInt64Slice(opNode.shape.Dimensions))
+		if err != nil {
+			return nil, errors.Wrapf(err, "%s: reshape output from 4D", opName)
 		}
 	}
 
@@ -3191,19 +3608,23 @@ func (f *Function) FusedScaledDotProductAttention(
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "SDPA: transpose V to BHSD")
 		}
-		// Also transpose mask if it's rank 4.
-		if mask != nil {
-			maskNode, _ := f.resolveNode(mask)
-			if maskNode != nil && maskNode.shape.Rank() == 4 {
-				mask, err = f.Transpose(mask, 0, 2, 1, 3)
-				if err != nil {
-					return nil, nil, errors.Wrap(err, "SDPA: transpose mask to BHSD")
-				}
-			}
-		}
 		qNode, _ = f.resolveNode(query)
 		kNode, _ = f.resolveNode(key)
 		vNode, _ = f.resolveNode(value)
+	}
+
+	seqLen := qNode.shape.Dimensions[2]
+	if mask != nil {
+		mask, err = f.normalizeSDPAMaskToBHSD(mask, isBSHD, numHeads, seqLen)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "SDPA: normalize mask")
+		}
+	}
+	if bias != nil {
+		bias, err = f.normalizeSDPAMaskToBHSD(bias, isBSHD, numHeads, seqLen)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "SDPA: normalize bias")
+		}
 	}
 
 	// Now everything is in BHSD layout: [B, H, Sq, D].
@@ -3223,45 +3644,11 @@ func (f *Function) FusedScaledDotProductAttention(
 		}
 	}
 
-	// Compute attention scores: Q @ K^T.
-	// Q: [B,H,Sq,D], K: [B,H,Sk,D] → scores: [B,H,Sq,Sk]
-	scores, err := f.DotGeneral(
-		query, []int{3}, []int{0, 1}, // contract dim(3), batch [B(0),H(1)]
-		kvKey, []int{3}, []int{0, 1}, // contract dim(3), batch [B(0),H(1)]
-		compute.DotGeneralConfig{})
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "SDPA: scores matmul")
-	}
+	dt := qNode.shape.DType
 
-	// Scale scores.
-	scoresNode, err := f.resolveNode(scores)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "SDPA: cast scores")
-	}
-	dt := scoresNode.shape.DType
-	scaleTensor, err := f.makeScalarConst(scale, dt)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "SDPA: scale constant")
-	}
-	scaledTensor, err := f.ctx().Mul(scoresNode.tensor, scaleTensor)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "SDPA: scale mul")
-	}
-	scores = &graphNode{tensor: scaledTensor, shape: scoresNode.shape, owner: f}
-
-	// Apply additive bias if provided.
-	if bias != nil {
-		scores, err = f.Add(scores, bias)
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "SDPA: add bias")
-		}
-	}
-
-	// Apply causal mask if needed: lower triangular.
+	// Build causal mask if needed: lower triangular [1, 1, Sq, Sk].
 	if causal {
-		seqLen := qNode.shape.Dimensions[2]  // Sq in BHSD
 		kvSeqLen := kNode.shape.Dimensions[2] // Sk in BHSD
-		// Create lower triangular mask: mask[i,j] = (i >= j).
 		maskShape := shapes.Make(dtypes.Int32, seqLen, kvSeqLen)
 		rowIota, err := f.Iota(maskShape, 0)
 		if err != nil {
@@ -3275,26 +3662,21 @@ func (f *Function) FusedScaledDotProductAttention(
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "SDPA: causal mask comparison")
 		}
-		// Reshape for broadcasting with BHSD scores: [1,1,Sq,Sk]
 		causalMask, err = f.Reshape(causalMask, 1, 1, seqLen, kvSeqLen)
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "SDPA: causal mask reshape")
 		}
 		if mask != nil {
-			// Combine causal mask with provided mask.
 			maskNode, mErr := f.resolveNode(mask)
 			if mErr != nil {
 				return nil, nil, errors.Wrap(mErr, "SDPA: resolve mask for causal combine")
 			}
 			if maskNode.shape.DType == dtypes.Bool {
-				// Boolean masks: AND them together.
 				mask, err = f.LogicalAnd(mask, causalMask)
 				if err != nil {
 					return nil, nil, errors.Wrap(err, "SDPA: combining boolean masks")
 				}
 			} else {
-				// Additive mask: convert causal to additive (-inf where false, 0 where true)
-				// and add to the existing additive mask.
 				causalNode, cErr := f.resolveNode(causalMask)
 				if cErr != nil {
 					return nil, nil, errors.Wrap(cErr, "SDPA: resolve causal mask")
@@ -3307,14 +3689,15 @@ func (f *Function) FusedScaledDotProductAttention(
 				if cErr != nil {
 					return nil, nil, errors.Wrap(cErr, "SDPA: causal zero constant")
 				}
-				// Where(causalBool, 0, -inf) to create additive causal mask
 				additiveCausal, cErr := f.ctx().Where(causalNode.tensor, zeroTensor, negInfTensor)
 				if cErr != nil {
 					return nil, nil, errors.Wrap(cErr, "SDPA: causal to additive")
 				}
-				additiveCausalNode := &graphNode{tensor: additiveCausal, shape: causalNode.shape, owner: f}
-				// Note: causalNode shape has Bool dtype, but additiveCausal is float - fix shape
-				additiveCausalNode.shape = shapes.Make(dt, causalNode.shape.Dimensions...)
+				additiveCausalNode := &graphNode{
+					tensor: additiveCausal,
+					shape:  shapes.Make(dt, causalNode.shape.Dimensions...),
+					owner:  f,
+				}
 				mask, err = f.Add(mask, additiveCausalNode)
 				if err != nil {
 					return nil, nil, errors.Wrap(err, "SDPA: combining additive masks")
@@ -3322,6 +3705,109 @@ func (f *Function) FusedScaledDotProductAttention(
 			}
 		} else {
 			mask = causalMask
+		}
+	}
+
+	// Try native MPSGraph scaledDotProductAttention (macOS 15.0+).
+	kvKeyNode, _ := f.resolveNode(kvKey)
+	kvValueNode, _ := f.resolveNode(kvValue)
+	var sdpaMaskTensor bridge.Tensor
+	canUseNativeSDPA := true
+	if mask != nil || bias != nil {
+		var additiveMask compute.Value
+		if mask != nil {
+			maskNode, mErr := f.resolveNode(mask)
+			if mErr != nil {
+				return nil, nil, errors.Wrap(mErr, "SDPA: mask resolve")
+			}
+			if maskNode.shape.DType == dtypes.Bool {
+				negInfTensor, cErr := f.makeScalarConst(math.Inf(-1), dt)
+				if cErr != nil {
+					return nil, nil, errors.Wrap(cErr, "SDPA: -inf constant")
+				}
+				zeroTensor, cErr := f.makeScalarConst(0, dt)
+				if cErr != nil {
+					return nil, nil, errors.Wrap(cErr, "SDPA: zero constant")
+				}
+				mDims := toInt64Slice(maskNode.shape.Dimensions)
+				zeroB, cErr := f.ctx().BroadcastTo(zeroTensor, mDims)
+				if cErr != nil {
+					canUseNativeSDPA = false
+				} else {
+					negInfB, cErr := f.ctx().BroadcastTo(negInfTensor, mDims)
+					if cErr != nil {
+						canUseNativeSDPA = false
+					} else {
+						addT, cErr := f.ctx().Where(maskNode.tensor, zeroB, negInfB)
+						if cErr != nil {
+							canUseNativeSDPA = false
+						} else {
+							additiveMask = &graphNode{
+								tensor: addT,
+								shape:  shapes.Make(dt, maskNode.shape.Dimensions...),
+								owner:  f,
+							}
+						}
+					}
+				}
+			} else {
+				additiveMask = maskNode
+			}
+		}
+		if canUseNativeSDPA && bias != nil {
+			if additiveMask != nil {
+				additiveMask, err = f.Add(additiveMask, bias)
+				if err != nil {
+					canUseNativeSDPA = false
+				}
+			} else {
+				additiveMask = bias
+			}
+		}
+		if canUseNativeSDPA && additiveMask != nil {
+			sdpaMaskTensor = additiveMask.(*graphNode).tensor
+		}
+	}
+	if canUseNativeSDPA {
+		if sdpaTensor, sErr := f.ctx().SDPA(qNode.tensor, kvKeyNode.tensor, kvValueNode.tensor, sdpaMaskTensor, float32(scale)); sErr == nil {
+			output = &graphNode{tensor: sdpaTensor, shape: qNode.shape, owner: f}
+			if isBSHD {
+				output, err = f.Transpose(output, 0, 2, 1, 3)
+				if err != nil {
+					return nil, nil, errors.Wrap(err, "SDPA: transpose output back to BSHD")
+				}
+			}
+			return output, nil, nil
+		}
+	}
+
+	// Fallback: decomposed Q @ K^T * scale + bias + mask -> Softmax -> @ V.
+	scores, err := f.DotGeneral(
+		query, []int{3}, []int{0, 1}, // contract dim(3), batch [B(0),H(1)]
+		kvKey, []int{3}, []int{0, 1}, // contract dim(3), batch [B(0),H(1)]
+		compute.DotGeneralConfig{})
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "SDPA: scores matmul")
+	}
+
+	scoresNode, err := f.resolveNode(scores)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "SDPA: cast scores")
+	}
+	scaleTensor, err := f.makeScalarConst(scale, dt)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "SDPA: scale constant")
+	}
+	scaledTensor, err := f.ctx().Mul(scoresNode.tensor, scaleTensor)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "SDPA: scale mul")
+	}
+	scores = &graphNode{tensor: scaledTensor, shape: scoresNode.shape, owner: f}
+
+	if bias != nil {
+		scores, err = f.Add(scores, bias)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "SDPA: add bias")
 		}
 	}
 
@@ -3443,7 +3929,39 @@ func (f *Function) repeatHeads(node *graphNode, headsAxis, repeats int) (compute
 	return f.Reshape(broadcasted, finalDims...)
 }
 
-// broadcastMaskToScores broadcasts a mask of arbitrary rank to the scores shape.
+// normalizeSDPAMaskToBHSD reshapes/transposes a 1D, 2D, 3D, or 4D attention mask or bias
+// into rank-4 BHSD layout [batch, heads, q_seq, kv_seq] (with size-1 broadcast dimensions).
+func (f *Function) normalizeSDPAMaskToBHSD(m compute.Value, isBSHD bool, numHeads, seqLen int) (compute.Value, error) {
+	mNode, err := f.resolveNode(m)
+	if err != nil {
+		return nil, err
+	}
+	dims := mNode.shape.Dimensions
+	switch mNode.shape.Rank() {
+	case 4:
+		if isBSHD {
+			// In BSHD, 4D mask is [B, Sq, H, Sk] unless already in BHSD [B, H, Sq, Sk].
+			bshdCompatible := (dims[1] == seqLen || dims[1] == 1) && (dims[2] == numHeads || dims[2] == 1)
+			if bshdCompatible {
+				return f.Transpose(m, 0, 2, 1, 3)
+			}
+		}
+		return m, nil
+	case 3:
+		// 3D mask/bias is [batch, q_seq, kv_seq] -> [batch, 1, q_seq, kv_seq].
+		return f.Reshape(m, dims[0], 1, dims[1], dims[2])
+	case 2:
+		// 2D mask/bias is [q_seq, kv_seq] -> [1, 1, q_seq, kv_seq].
+		return f.Reshape(m, 1, 1, dims[0], dims[1])
+	case 1:
+		// 1D mask/bias is [kv_seq] -> [1, 1, 1, kv_seq].
+		return f.Reshape(m, 1, 1, 1, dims[0])
+	default:
+		return m, nil
+	}
+}
+
+// broadcastMaskToScores broadcasts a normalized mask to the scores shape.
 func (f *Function) broadcastMaskToScores(mask compute.Value, scoresShape shapes.Shape) (compute.Value, error) {
 	maskNode, err := f.resolveNode(mask)
 	if err != nil {
