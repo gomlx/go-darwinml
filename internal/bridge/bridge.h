@@ -197,9 +197,12 @@ MPSGraphTensorHandle mpsgraph_argmin(MPSGraphContextHandle ctx, MPSGraphTensorHa
 MPSGraphTensorHandle mpsgraph_argmax(MPSGraphContextHandle ctx, MPSGraphTensorHandle x,
     int axis, int outputDtype, MPSGraphError* error);
 
-// --- Softmax ---
+// --- Softmax & SDPA ---
 MPSGraphTensorHandle mpsgraph_softmax(MPSGraphContextHandle ctx,
     MPSGraphTensorHandle x, int axis, MPSGraphError* error);
+MPSGraphTensorHandle mpsgraph_sdpa(MPSGraphContextHandle ctx,
+    MPSGraphTensorHandle q, MPSGraphTensorHandle k, MPSGraphTensorHandle v,
+    MPSGraphTensorHandle mask, float scale, MPSGraphError* error);
 
 // --- Random Number Generation ---
 MPSGraphTensorHandle mpsgraph_random_uniform(MPSGraphContextHandle ctx,

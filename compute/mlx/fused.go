@@ -730,21 +730,23 @@ func (f *Function) FusedScaledDotProductAttention(
 		if err != nil {
 			return nil, nil, err
 		}
-		if mask != nil {
-			maskNode, err := f.resolveNode(mask)
-			if err != nil {
-				return nil, nil, err
-			}
-			if maskNode.shape.Rank() == 4 {
-				mask, err = f.Transpose(mask, 0, 2, 1, 3)
-				if err != nil {
-					return nil, nil, err
-				}
-			}
-		}
 		qNode = query.(*graphNode)
 		kNode = key.(*graphNode)
 		vNode = value.(*graphNode)
+	}
+
+	seqLen := qNode.shape.Dimensions[2]
+	if mask != nil {
+		mask, err = f.normalizeSDPAMaskToBHSD(mask, isBSHD, numHeads, seqLen)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	if bias != nil {
+		bias, err = f.normalizeSDPAMaskToBHSD(bias, isBSHD, numHeads, seqLen)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	kvKey := key
@@ -895,6 +897,38 @@ func (f *Function) FusedScaledDotProductAttention(
 		}
 	}
 	return output, nil, nil
+}
+
+// normalizeSDPAMaskToBHSD reshapes/transposes a 1D, 2D, 3D, or 4D attention mask or bias
+// into rank-4 BHSD layout [batch, heads, q_seq, kv_seq] (with size-1 broadcast dimensions).
+func (f *Function) normalizeSDPAMaskToBHSD(m compute.Value, isBSHD bool, numHeads, seqLen int) (compute.Value, error) {
+	mNode, err := f.resolveNode(m)
+	if err != nil {
+		return nil, err
+	}
+	dims := mNode.shape.Dimensions
+	switch mNode.shape.Rank() {
+	case 4:
+		if isBSHD {
+			// In BSHD, 4D mask is [B, Sq, H, Sk] unless already in BHSD [B, H, Sq, Sk].
+			bshdCompatible := (dims[1] == seqLen || dims[1] == 1) && (dims[2] == numHeads || dims[2] == 1)
+			if bshdCompatible {
+				return f.Transpose(m, 0, 2, 1, 3)
+			}
+		}
+		return m, nil
+	case 3:
+		// 3D mask/bias is [batch, q_seq, kv_seq] -> [batch, 1, q_seq, kv_seq].
+		return f.Reshape(m, dims[0], 1, dims[1], dims[2])
+	case 2:
+		// 2D mask/bias is [q_seq, kv_seq] -> [1, 1, q_seq, kv_seq].
+		return f.Reshape(m, 1, 1, dims[0], dims[1])
+	case 1:
+		// 1D mask/bias is [kv_seq] -> [1, 1, 1, kv_seq].
+		return f.Reshape(m, 1, 1, 1, dims[0])
+	default:
+		return m, nil
+	}
 }
 
 // alignTrailingRank prepends size-1 dimensions to v if its rank is smaller than targetRank,

@@ -1498,6 +1498,43 @@ MPSGraphTensorHandle mpsgraph_softmax(MPSGraphContextHandle handle, MPSGraphTens
     }
 }
 
+MPSGraphTensorHandle mpsgraph_sdpa(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle qH, MPSGraphTensorHandle kH, MPSGraphTensorHandle vH,
+    MPSGraphTensorHandle maskH, float scale, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        if (@available(macOS 15.0, *)) {
+            MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+            MPSGraphTensor* q = (__bridge MPSGraphTensor*)qH;
+            MPSGraphTensor* k = (__bridge MPSGraphTensor*)kH;
+            MPSGraphTensor* v = (__bridge MPSGraphTensor*)vH;
+            MPSGraphTensor* m = maskH ? (__bridge MPSGraphTensor*)maskH : nil;
+            MPSGraphTensor* result = nil;
+            if (m) {
+                result = [ctx.graph scaledDotProductAttentionWithQueryTensor:q
+                                                                   keyTensor:k
+                                                                 valueTensor:v
+                                                                  maskTensor:m
+                                                                       scale:scale
+                                                                        name:nil];
+            } else {
+                result = [ctx.graph scaledDotProductAttentionWithQueryTensor:q
+                                                                   keyTensor:k
+                                                                 valueTensor:v
+                                                                       scale:scale
+                                                                        name:nil];
+            }
+            if (!result) {
+                setError(error, 205, @"scaledDotProductAttention failed");
+                return NULL;
+            }
+            return (__bridge void*)result;
+        }
+        setError(error, 206, @"scaledDotProductAttention requires macOS 15.0+");
+        return NULL;
+    }
+}
+
 // ===========================================================================
 // Random Number Generation
 // ===========================================================================

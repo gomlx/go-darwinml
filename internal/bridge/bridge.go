@@ -639,6 +639,18 @@ func (c *Context) Softmax(x Tensor, axis int) (Tensor, error) {
 	return Tensor(t), nil
 }
 
+// SDPA computes scaled dot-product attention on [B, H, S, D] tensors (macOS 15.0+).
+func (c *Context) SDPA(q, k, v, mask Tensor, scale float32) (Tensor, error) {
+	var cErr C.MPSGraphError
+	t := C.mpsgraph_sdpa(c.handle,
+		C.MPSGraphTensorHandle(q), C.MPSGraphTensorHandle(k), C.MPSGraphTensorHandle(v),
+		C.MPSGraphTensorHandle(mask), C.float(scale), &cErr)
+	if err := extractError(cErr); err != nil {
+		return nil, err
+	}
+	return Tensor(t), nil
+}
+
 // ===========================================================================
 // Pooling (ReduceWindow)
 // ===========================================================================

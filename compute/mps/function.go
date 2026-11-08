@@ -3608,19 +3608,23 @@ func (f *Function) FusedScaledDotProductAttention(
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "SDPA: transpose V to BHSD")
 		}
-		// Also transpose mask if it's rank 4.
-		if mask != nil {
-			maskNode, _ := f.resolveNode(mask)
-			if maskNode != nil && maskNode.shape.Rank() == 4 {
-				mask, err = f.Transpose(mask, 0, 2, 1, 3)
-				if err != nil {
-					return nil, nil, errors.Wrap(err, "SDPA: transpose mask to BHSD")
-				}
-			}
-		}
 		qNode, _ = f.resolveNode(query)
 		kNode, _ = f.resolveNode(key)
 		vNode, _ = f.resolveNode(value)
+	}
+
+	seqLen := qNode.shape.Dimensions[2]
+	if mask != nil {
+		mask, err = f.normalizeSDPAMaskToBHSD(mask, isBSHD, numHeads, seqLen)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "SDPA: normalize mask")
+		}
+	}
+	if bias != nil {
+		bias, err = f.normalizeSDPAMaskToBHSD(bias, isBSHD, numHeads, seqLen)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "SDPA: normalize bias")
+		}
 	}
 
 	// Now everything is in BHSD layout: [B, H, Sq, D].
@@ -3640,45 +3644,11 @@ func (f *Function) FusedScaledDotProductAttention(
 		}
 	}
 
-	// Compute attention scores: Q @ K^T.
-	// Q: [B,H,Sq,D], K: [B,H,Sk,D] → scores: [B,H,Sq,Sk]
-	scores, err := f.DotGeneral(
-		query, []int{3}, []int{0, 1}, // contract dim(3), batch [B(0),H(1)]
-		kvKey, []int{3}, []int{0, 1}, // contract dim(3), batch [B(0),H(1)]
-		compute.DotGeneralConfig{})
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "SDPA: scores matmul")
-	}
+	dt := qNode.shape.DType
 
-	// Scale scores.
-	scoresNode, err := f.resolveNode(scores)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "SDPA: cast scores")
-	}
-	dt := scoresNode.shape.DType
-	scaleTensor, err := f.makeScalarConst(scale, dt)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "SDPA: scale constant")
-	}
-	scaledTensor, err := f.ctx().Mul(scoresNode.tensor, scaleTensor)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "SDPA: scale mul")
-	}
-	scores = &graphNode{tensor: scaledTensor, shape: scoresNode.shape, owner: f}
-
-	// Apply additive bias if provided.
-	if bias != nil {
-		scores, err = f.Add(scores, bias)
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "SDPA: add bias")
-		}
-	}
-
-	// Apply causal mask if needed: lower triangular.
+	// Build causal mask if needed: lower triangular [1, 1, Sq, Sk].
 	if causal {
-		seqLen := qNode.shape.Dimensions[2]  // Sq in BHSD
 		kvSeqLen := kNode.shape.Dimensions[2] // Sk in BHSD
-		// Create lower triangular mask: mask[i,j] = (i >= j).
 		maskShape := shapes.Make(dtypes.Int32, seqLen, kvSeqLen)
 		rowIota, err := f.Iota(maskShape, 0)
 		if err != nil {
@@ -3692,26 +3662,21 @@ func (f *Function) FusedScaledDotProductAttention(
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "SDPA: causal mask comparison")
 		}
-		// Reshape for broadcasting with BHSD scores: [1,1,Sq,Sk]
 		causalMask, err = f.Reshape(causalMask, 1, 1, seqLen, kvSeqLen)
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "SDPA: causal mask reshape")
 		}
 		if mask != nil {
-			// Combine causal mask with provided mask.
 			maskNode, mErr := f.resolveNode(mask)
 			if mErr != nil {
 				return nil, nil, errors.Wrap(mErr, "SDPA: resolve mask for causal combine")
 			}
 			if maskNode.shape.DType == dtypes.Bool {
-				// Boolean masks: AND them together.
 				mask, err = f.LogicalAnd(mask, causalMask)
 				if err != nil {
 					return nil, nil, errors.Wrap(err, "SDPA: combining boolean masks")
 				}
 			} else {
-				// Additive mask: convert causal to additive (-inf where false, 0 where true)
-				// and add to the existing additive mask.
 				causalNode, cErr := f.resolveNode(causalMask)
 				if cErr != nil {
 					return nil, nil, errors.Wrap(cErr, "SDPA: resolve causal mask")
@@ -3724,14 +3689,15 @@ func (f *Function) FusedScaledDotProductAttention(
 				if cErr != nil {
 					return nil, nil, errors.Wrap(cErr, "SDPA: causal zero constant")
 				}
-				// Where(causalBool, 0, -inf) to create additive causal mask
 				additiveCausal, cErr := f.ctx().Where(causalNode.tensor, zeroTensor, negInfTensor)
 				if cErr != nil {
 					return nil, nil, errors.Wrap(cErr, "SDPA: causal to additive")
 				}
-				additiveCausalNode := &graphNode{tensor: additiveCausal, shape: causalNode.shape, owner: f}
-				// Note: causalNode shape has Bool dtype, but additiveCausal is float - fix shape
-				additiveCausalNode.shape = shapes.Make(dt, causalNode.shape.Dimensions...)
+				additiveCausalNode := &graphNode{
+					tensor: additiveCausal,
+					shape:  shapes.Make(dt, causalNode.shape.Dimensions...),
+					owner:  f,
+				}
 				mask, err = f.Add(mask, additiveCausalNode)
 				if err != nil {
 					return nil, nil, errors.Wrap(err, "SDPA: combining additive masks")
@@ -3739,6 +3705,109 @@ func (f *Function) FusedScaledDotProductAttention(
 			}
 		} else {
 			mask = causalMask
+		}
+	}
+
+	// Try native MPSGraph scaledDotProductAttention (macOS 15.0+).
+	kvKeyNode, _ := f.resolveNode(kvKey)
+	kvValueNode, _ := f.resolveNode(kvValue)
+	var sdpaMaskTensor bridge.Tensor
+	canUseNativeSDPA := true
+	if mask != nil || bias != nil {
+		var additiveMask compute.Value
+		if mask != nil {
+			maskNode, mErr := f.resolveNode(mask)
+			if mErr != nil {
+				return nil, nil, errors.Wrap(mErr, "SDPA: mask resolve")
+			}
+			if maskNode.shape.DType == dtypes.Bool {
+				negInfTensor, cErr := f.makeScalarConst(math.Inf(-1), dt)
+				if cErr != nil {
+					return nil, nil, errors.Wrap(cErr, "SDPA: -inf constant")
+				}
+				zeroTensor, cErr := f.makeScalarConst(0, dt)
+				if cErr != nil {
+					return nil, nil, errors.Wrap(cErr, "SDPA: zero constant")
+				}
+				mDims := toInt64Slice(maskNode.shape.Dimensions)
+				zeroB, cErr := f.ctx().BroadcastTo(zeroTensor, mDims)
+				if cErr != nil {
+					canUseNativeSDPA = false
+				} else {
+					negInfB, cErr := f.ctx().BroadcastTo(negInfTensor, mDims)
+					if cErr != nil {
+						canUseNativeSDPA = false
+					} else {
+						addT, cErr := f.ctx().Where(maskNode.tensor, zeroB, negInfB)
+						if cErr != nil {
+							canUseNativeSDPA = false
+						} else {
+							additiveMask = &graphNode{
+								tensor: addT,
+								shape:  shapes.Make(dt, maskNode.shape.Dimensions...),
+								owner:  f,
+							}
+						}
+					}
+				}
+			} else {
+				additiveMask = maskNode
+			}
+		}
+		if canUseNativeSDPA && bias != nil {
+			if additiveMask != nil {
+				additiveMask, err = f.Add(additiveMask, bias)
+				if err != nil {
+					canUseNativeSDPA = false
+				}
+			} else {
+				additiveMask = bias
+			}
+		}
+		if canUseNativeSDPA && additiveMask != nil {
+			sdpaMaskTensor = additiveMask.(*graphNode).tensor
+		}
+	}
+	if canUseNativeSDPA {
+		if sdpaTensor, sErr := f.ctx().SDPA(qNode.tensor, kvKeyNode.tensor, kvValueNode.tensor, sdpaMaskTensor, float32(scale)); sErr == nil {
+			output = &graphNode{tensor: sdpaTensor, shape: qNode.shape, owner: f}
+			if isBSHD {
+				output, err = f.Transpose(output, 0, 2, 1, 3)
+				if err != nil {
+					return nil, nil, errors.Wrap(err, "SDPA: transpose output back to BSHD")
+				}
+			}
+			return output, nil, nil
+		}
+	}
+
+	// Fallback: decomposed Q @ K^T * scale + bias + mask -> Softmax -> @ V.
+	scores, err := f.DotGeneral(
+		query, []int{3}, []int{0, 1}, // contract dim(3), batch [B(0),H(1)]
+		kvKey, []int{3}, []int{0, 1}, // contract dim(3), batch [B(0),H(1)]
+		compute.DotGeneralConfig{})
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "SDPA: scores matmul")
+	}
+
+	scoresNode, err := f.resolveNode(scores)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "SDPA: cast scores")
+	}
+	scaleTensor, err := f.makeScalarConst(scale, dt)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "SDPA: scale constant")
+	}
+	scaledTensor, err := f.ctx().Mul(scoresNode.tensor, scaleTensor)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "SDPA: scale mul")
+	}
+	scores = &graphNode{tensor: scaledTensor, shape: scoresNode.shape, owner: f}
+
+	if bias != nil {
+		scores, err = f.Add(scores, bias)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "SDPA: add bias")
 		}
 	}
 
@@ -3860,7 +3929,39 @@ func (f *Function) repeatHeads(node *graphNode, headsAxis, repeats int) (compute
 	return f.Reshape(broadcasted, finalDims...)
 }
 
-// broadcastMaskToScores broadcasts a mask of arbitrary rank to the scores shape.
+// normalizeSDPAMaskToBHSD reshapes/transposes a 1D, 2D, 3D, or 4D attention mask or bias
+// into rank-4 BHSD layout [batch, heads, q_seq, kv_seq] (with size-1 broadcast dimensions).
+func (f *Function) normalizeSDPAMaskToBHSD(m compute.Value, isBSHD bool, numHeads, seqLen int) (compute.Value, error) {
+	mNode, err := f.resolveNode(m)
+	if err != nil {
+		return nil, err
+	}
+	dims := mNode.shape.Dimensions
+	switch mNode.shape.Rank() {
+	case 4:
+		if isBSHD {
+			// In BSHD, 4D mask is [B, Sq, H, Sk] unless already in BHSD [B, H, Sq, Sk].
+			bshdCompatible := (dims[1] == seqLen || dims[1] == 1) && (dims[2] == numHeads || dims[2] == 1)
+			if bshdCompatible {
+				return f.Transpose(m, 0, 2, 1, 3)
+			}
+		}
+		return m, nil
+	case 3:
+		// 3D mask/bias is [batch, q_seq, kv_seq] -> [batch, 1, q_seq, kv_seq].
+		return f.Reshape(m, dims[0], 1, dims[1], dims[2])
+	case 2:
+		// 2D mask/bias is [q_seq, kv_seq] -> [1, 1, q_seq, kv_seq].
+		return f.Reshape(m, 1, 1, dims[0], dims[1])
+	case 1:
+		// 1D mask/bias is [kv_seq] -> [1, 1, 1, kv_seq].
+		return f.Reshape(m, 1, 1, 1, dims[0])
+	default:
+		return m, nil
+	}
+}
+
+// broadcastMaskToScores broadcasts a normalized mask to the scores shape.
 func (f *Function) broadcastMaskToScores(mask compute.Value, scoresShape shapes.Shape) (compute.Value, error) {
 	maskNode, err := f.resolveNode(mask)
 	if err != nil {
