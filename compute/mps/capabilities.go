@@ -92,8 +92,10 @@ var backendCapabilities = compute.Capabilities{
 		compute.OpTypeReduceMin:     true,
 		compute.OpTypeReduceProduct: true,
 
-		// ArgMin/ArgMax
+		// ArgMin/ArgMax & Cumulative
 		compute.OpTypeArgMinMax: true,
+		compute.OpTypeCumSum:    true,
+		compute.OpTypeCumMax:    true,
 
 		// Batch normalization
 		compute.OpTypeBatchNormForInference: true,
@@ -117,6 +119,7 @@ var backendCapabilities = compute.Capabilities{
 		// Pooling
 		compute.OpTypeReduceWindow:        true,
 		compute.OpTypeSelectAndScatterMax: true,
+		compute.OpTypeSelectAndScatterMin: true,
 
 		// TotalOrder comparisons
 		compute.OpTypeEqualTotalOrder:          true,

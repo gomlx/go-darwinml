@@ -55,6 +55,14 @@ const (
 	ScatterModeMin = 3
 )
 
+// CumulativeMode for cumulative operations — must match bridge.m switch cases.
+const (
+	CumulativeSum     = 0
+	CumulativeProduct = 1
+	CumulativeMax     = 2
+	CumulativeMin     = 3
+)
+
 // Tensor is an opaque handle to an MPSGraphTensor in the computation graph.
 type Tensor = unsafe.Pointer
 
@@ -645,6 +653,33 @@ func (c *Context) Pool2D(x Tensor, mode int, windowDims, strides, padBefore, pad
 		(*C.int64_t)(unsafe.Pointer(&padBefore[0])),
 		(*C.int64_t)(unsafe.Pointer(&padAfter[0])),
 		&cErr)
+	if err := extractError(cErr); err != nil {
+		return nil, err
+	}
+	return Tensor(t), nil
+}
+
+// Pool4D performs 4D pooling (max or average) across all 4 dimensions of a 4D tensor.
+// mode: 0=max, 1=avg
+func (c *Context) Pool4D(x Tensor, mode int, windowDims, strides, dilations, padBefore, padAfter []int64) (Tensor, error) {
+	var cErr C.MPSGraphError
+	t := C.mpsgraph_pool4d(c.handle, C.MPSGraphTensorHandle(x), C.int(mode),
+		(*C.int64_t)(unsafe.Pointer(&windowDims[0])),
+		(*C.int64_t)(unsafe.Pointer(&strides[0])),
+		(*C.int64_t)(unsafe.Pointer(&dilations[0])),
+		(*C.int64_t)(unsafe.Pointer(&padBefore[0])),
+		(*C.int64_t)(unsafe.Pointer(&padAfter[0])),
+		&cErr)
+	if err := extractError(cErr); err != nil {
+		return nil, err
+	}
+	return Tensor(t), nil
+}
+
+// Cumulative performs a cumulative reduction (sum, product, max, min) along axis.
+func (c *Context) Cumulative(x Tensor, mode, axis int, exclusive, reverse bool) (Tensor, error) {
+	var cErr C.MPSGraphError
+	t := C.mpsgraph_cumulative(c.handle, C.MPSGraphTensorHandle(x), C.int(mode), C.int(axis), C.bool(exclusive), C.bool(reverse), &cErr)
 	if err := extractError(cErr); err != nil {
 		return nil, err
 	}

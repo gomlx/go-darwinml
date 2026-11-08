@@ -1570,6 +1570,101 @@ MPSGraphTensorHandle mpsgraph_pool2d(MPSGraphContextHandle handle, MPSGraphTenso
     }
 }
 
+MPSGraphTensorHandle mpsgraph_pool4d(MPSGraphContextHandle handle, MPSGraphTensorHandle x,
+    int mode, int64_t* windowDims, int64_t* strides, int64_t* dilations,
+    int64_t* padBefore, int64_t* padAfter,
+    MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+
+        NSArray<NSNumber*>* kernelSizes = @[
+            @(windowDims[0]), @(windowDims[1]), @(windowDims[2]), @(windowDims[3])
+        ];
+        NSArray<NSNumber*>* strideArr = @[
+            @(strides[0]), @(strides[1]), @(strides[2]), @(strides[3])
+        ];
+        NSArray<NSNumber*>* dilationArr = @[
+            @(dilations[0]), @(dilations[1]), @(dilations[2]), @(dilations[3])
+        ];
+        NSArray<NSNumber*>* padArr = @[
+            @(padBefore[0]), @(padAfter[0]),
+            @(padBefore[1]), @(padAfter[1]),
+            @(padBefore[2]), @(padAfter[2]),
+            @(padBefore[3]), @(padAfter[3])
+        ];
+
+        MPSGraphPooling4DOpDescriptor* desc = [MPSGraphPooling4DOpDescriptor
+            descriptorWithKernelSizes:kernelSizes
+                              strides:strideArr
+                        dilationRates:dilationArr
+                        paddingValues:padArr
+                         paddingStyle:MPSGraphPaddingStyleExplicit];
+        if (mode == 1) {
+            desc.includeZeroPadToAverage = YES;
+        }
+
+        MPSGraphTensor* result = nil;
+        switch (mode) {
+            case 0: // Max pooling
+                result = [ctx.graph maxPooling4DWithSourceTensor:input descriptor:desc name:nil];
+                break;
+            case 1: // Average pooling
+                result = [ctx.graph avgPooling4DWithSourceTensor:input descriptor:desc name:nil];
+                break;
+            default:
+                setError(error, 222, @"unsupported 4D pooling mode");
+                return NULL;
+        }
+        if (!result) {
+            setError(error, 223, @"4D pooling failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
+// ===========================================================================
+// Cumulative Operations
+// ===========================================================================
+
+MPSGraphTensorHandle mpsgraph_cumulative(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle x, int mode, int axis, bool exclusive, bool reverse,
+    MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        BOOL ex = exclusive ? YES : NO;
+        BOOL rev = reverse ? YES : NO;
+
+        MPSGraphTensor* result = nil;
+        switch (mode) {
+            case 0: // Sum
+                result = [ctx.graph cumulativeSumWithTensor:input axis:axis exclusive:ex reverse:rev name:nil];
+                break;
+            case 1: // Product
+                result = [ctx.graph cumulativeProductWithTensor:input axis:axis exclusive:ex reverse:rev name:nil];
+                break;
+            case 2: // Max
+                result = [ctx.graph cumulativeMaximumWithTensor:input axis:axis exclusive:ex reverse:rev name:nil];
+                break;
+            case 3: // Min
+                result = [ctx.graph cumulativeMinimumWithTensor:input axis:axis exclusive:ex reverse:rev name:nil];
+                break;
+            default:
+                setError(error, 250, @"unsupported cumulative mode");
+                return NULL;
+        }
+        if (!result) {
+            setError(error, 251, @"cumulative op failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
 // ===========================================================================
 // Max Pool 2D Gradient (SelectAndScatter)
 // ===========================================================================
