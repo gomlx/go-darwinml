@@ -429,37 +429,17 @@ MPSGraphTensorHandle mpsgraph_transpose(MPSGraphContextHandle handle, MPSGraphTe
         MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
         MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
 
-        // Apply transposition by chaining pairwise swaps to achieve the target permutation.
-        // We build the permutation incrementally: for each position i, find where the target
-        // axis currently is and swap it into place.
-        int current[rank];
-        for (int i = 0; i < rank; i++) current[i] = i;
-
-        MPSGraphTensor* result = input;
-        for (int i = 0; i < rank; i++) {
-            int target = permutation[i];
-            if (current[i] == target) continue;
-
-            // Find where target currently is.
-            int j = -1;
-            for (int k = i; k < rank; k++) {
-                if (current[k] == target) { j = k; break; }
-            }
-            if (j < 0) {
-                setError(error, 31, @"invalid permutation in transpose");
-                return NULL;
-            }
-
-            result = [ctx.graph transposeTensor:result
-                                      dimension:(NSUInteger)i
-                                  withDimension:(NSUInteger)j
-                                           name:nil];
-            // Update tracking.
-            int tmp = current[i];
-            current[i] = current[j];
-            current[j] = tmp;
+        if (rank <= 1) {
+            return (__bridge void*)input;
         }
-
+        NSArray<NSNumber*>* permArr = intArray(permutation, rank);
+        MPSGraphTensor* result = [ctx.graph transposeTensor:input
+                                                permutation:permArr
+                                                       name:nil];
+        if (!result) {
+            setError(error, 31, @"transpose failed");
+            return NULL;
+        }
         return (__bridge void*)result;
     }
 }
@@ -594,36 +574,28 @@ MPSGraphTensorHandle mpsgraph_pad(MPSGraphContextHandle handle, MPSGraphTensorHa
             setError(error, 37, @"pad failed");
             return NULL;
         }
+        if (!fillTensor) {
+            return (__bridge void*)paddedInput;
+        }
 
-        // Step 2: Build a mask to identify padding positions.
-        // Create a ones tensor with the input shape, pad it with 0.0.
-        // Result: 1 where original data, 0 where padding.
-        MPSGraphTensor* ones = [ctx.graph constantWithScalar:1.0
-                                                       shape:input.shape
-                                                    dataType:input.dataType];
-        MPSGraphTensor* mask = [ctx.graph padTensor:ones
+        // Step 2: Build a boolean mask (true where original data, false where padding)
+        // and select between paddedInput and fillTensor. Using selectWithPredicateTensor
+        // avoids 0 * (±Inf) = NaN when fillTensor is ±Inf and works for all dtypes including Bool.
+        MPSGraphTensor* onesBool = [ctx.graph constantWithScalar:1.0
+                                                           shape:input.shape
+                                                        dataType:MPSDataTypeBool];
+        MPSGraphTensor* mask = [ctx.graph padTensor:onesBool
                                     withPaddingMode:mode
                                         leftPadding:leftPad
                                        rightPadding:rightPad
                                       constantValue:0.0
                                                name:nil];
-
-        // Step 3: Invert the mask: 1 where padding, 0 where data.
-        MPSGraphTensor* onesLike = [ctx.graph constantWithScalar:1.0
-                                                           shape:paddedInput.shape
-                                                        dataType:input.dataType];
-        MPSGraphTensor* invertedMask = [ctx.graph subtractionWithPrimaryTensor:onesLike
-                                                              secondaryTensor:mask
-                                                                         name:nil];
-
-        // Step 4: Multiply inverted mask by fillTensor (broadcast).
-        MPSGraphTensor* fillBroadcast = [ctx.graph multiplicationWithPrimaryTensor:invertedMask
-                                                                  secondaryTensor:fillTensor
-                                                                             name:nil];
-
-        // Step 5: Add to padded input.
-        MPSGraphTensor* result = [ctx.graph additionWithPrimaryTensor:paddedInput
-                                                     secondaryTensor:fillBroadcast
+        MPSGraphTensor* fillBroadcast = [ctx.graph broadcastTensor:fillTensor
+                                                           toShape:paddedInput.shape
+                                                              name:nil];
+        MPSGraphTensor* result = [ctx.graph selectWithPredicateTensor:mask
+                                                 truePredicateTensor:paddedInput
+                                                falsePredicateTensor:fillBroadcast
                                                                 name:nil];
         if (!result) {
             setError(error, 37, @"pad with fill value failed");
@@ -1159,8 +1131,10 @@ MPSGraphExecHandle mpsgraph_compile(MPSGraphContextHandle handle,
             [targetTensors addObject:(__bridge MPSGraphTensor*)targets[i]];
         }
 
-        // Compile.
+        // Compile for GPU (Level0 runs core GPU optimizations without attempting ANE placement,
+        // which avoids multi-second _ANECompiler failures on general compute graphs).
         MPSGraphCompilationDescriptor* compDesc = [[MPSGraphCompilationDescriptor alloc] init];
+        compDesc.optimizationLevel = MPSGraphOptimizationLevel0;
         MPSGraphExecutable* exec = nil;
         @try {
             exec = [ctx.graph compileWithDevice:[MPSGraphDevice deviceWithMTLDevice:ctx.device]

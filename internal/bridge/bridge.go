@@ -379,6 +379,9 @@ func (c *Context) Reshape(x Tensor, shape []int64) (Tensor, error) {
 
 // Transpose reorders the dimensions of a tensor according to the given permutation.
 func (c *Context) Transpose(x Tensor, permutation []int) (Tensor, error) {
+	if len(permutation) <= 1 {
+		return x, nil
+	}
 	var cErr C.MPSGraphError
 	cPerm := make([]C.int, len(permutation))
 	for i, v := range permutation {

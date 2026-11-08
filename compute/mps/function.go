@@ -1669,7 +1669,33 @@ func (f *Function) Pad(operand, fillValue compute.Value, axesConfig ...compute.P
 		}
 	}
 
-	// Step 2: Handle negative Start / End padding (cropping) via Slice.
+	// Step 2: Handle positive Start / End padding via Pad first so cropping
+	// never produces a zero-sized intermediate tensor when all input elements
+	// on an axis are cropped out.
+	hasPad := false
+	padBefore := make([]int64, rank)
+	padAfter := make([]int64, rank)
+	for i, ac := range axesConfig {
+		if ac.Start > 0 {
+			padBefore[i] = int64(ac.Start)
+			hasPad = true
+		}
+		if ac.End > 0 {
+			padAfter[i] = int64(ac.End)
+			hasPad = true
+		}
+	}
+	if hasPad {
+		tensor, err = f.ctx().Pad(tensor, fillNode.tensor, padBefore, padAfter)
+		if err != nil {
+			return nil, errors.Wrap(err, "Pad")
+		}
+		for i := range rank {
+			currentShape[i] += padBefore[i] + padAfter[i]
+		}
+	}
+
+	// Step 3: Handle negative Start / End padding (cropping) via Slice.
 	hasCrop := false
 	cropStarts := make([]int64, rank)
 	cropEnds := make([]int64, rank)
@@ -1690,30 +1716,6 @@ func (f *Function) Pad(operand, fillValue compute.Value, axesConfig ...compute.P
 		tensor, err = f.ctx().Slice(tensor, cropStarts, cropEnds, cropStrides)
 		if err != nil {
 			return nil, errors.Wrap(err, "Pad: negative padding slice")
-		}
-		for i := range rank {
-			currentShape[i] = cropEnds[i] - cropStarts[i]
-		}
-	}
-
-	// Step 3: Handle positive Start / End padding via Pad.
-	hasPad := false
-	padBefore := make([]int64, rank)
-	padAfter := make([]int64, rank)
-	for i, ac := range axesConfig {
-		if ac.Start > 0 {
-			padBefore[i] = int64(ac.Start)
-			hasPad = true
-		}
-		if ac.End > 0 {
-			padAfter[i] = int64(ac.End)
-			hasPad = true
-		}
-	}
-	if hasPad {
-		tensor, err = f.ctx().Pad(tensor, fillNode.tensor, padBefore, padAfter)
-		if err != nil {
-			return nil, errors.Wrap(err, "Pad")
 		}
 	}
 
@@ -2160,12 +2162,7 @@ func (f *Function) dilateAxis(tensor bridge.Tensor, axis int, axisSize, dilation
 	padAfter := make([]int64, rank+1)
 	padAfter[axis+1] = dilation - 1
 
-	zeroTensor, err := f.makeScalarConst(0, dtype)
-	if err != nil {
-		return nil, err
-	}
-
-	result, err = f.ctx().Pad(result, zeroTensor, padBefore, padAfter)
+	result, err = f.ctx().Pad(result, nil, padBefore, padAfter)
 	if err != nil {
 		return nil, err
 	}
