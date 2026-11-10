@@ -1248,7 +1248,31 @@ func (f *Function) Pad(operand, fillValue compute.Value, axesConfig ...compute.P
 		}
 	}
 
-	// Step 2: Handle negative Start / End padding (cropping) via Slice.
+	// Step 2: Handle positive Start / End padding via Pad first so cropping
+	// never produces a zero-sized or negative intermediate tensor when all input
+	// elements on an axis are cropped out into opposite-side padding.
+	var padAxes, lowPads, highPads []int
+	for i, ac := range fullConfig {
+		low := max(0, ac.Start)
+		high := max(0, ac.End)
+		if low > 0 || high > 0 {
+			padAxes = append(padAxes, i)
+			lowPads = append(lowPads, low)
+			highPads = append(highPads, high)
+			if curShape[i] != shapes.DynamicDim {
+				curShape[i] += low + high
+			}
+		}
+	}
+	if len(padAxes) > 0 {
+		curID, err = f.builder.tape.AddPad(curID, fillNode.id, padAxes, lowPads, highPads)
+		if err != nil {
+			return nil, errors.Wrap(err, "Pad: edge pad")
+		}
+		didWork = true
+	}
+
+	// Step 3: Handle negative Start / End padding (cropping) via Slice.
 	hasCrop := false
 	cropStarts := make([]int, rank)
 	cropLimits := slices.Clone(curShape)
@@ -1273,25 +1297,6 @@ func (f *Function) Pad(operand, fillValue compute.Value, axesConfig ...compute.P
 			if curShape[i] != shapes.DynamicDim {
 				curShape[i] = cropLimits[i] - cropStarts[i]
 			}
-		}
-		didWork = true
-	}
-
-	// Step 3: Handle positive Start / End padding via Pad.
-	var padAxes, lowPads, highPads []int
-	for i, ac := range fullConfig {
-		low := max(0, ac.Start)
-		high := max(0, ac.End)
-		if low > 0 || high > 0 {
-			padAxes = append(padAxes, i)
-			lowPads = append(lowPads, low)
-			highPads = append(highPads, high)
-		}
-	}
-	if len(padAxes) > 0 {
-		curID, err = f.builder.tape.AddPad(curID, fillNode.id, padAxes, lowPads, highPads)
-		if err != nil {
-			return nil, errors.Wrap(err, "Pad: edge pad")
 		}
 		didWork = true
 	}
