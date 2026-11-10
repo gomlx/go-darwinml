@@ -1695,14 +1695,16 @@ func (f *Function) Pad(operand, fillValue compute.Value, axesConfig ...compute.P
 		return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 	}
 
-	rank := len(axesConfig)
+	rank := opNode.shape.Rank()
+	fullConfig := make([]compute.PadAxis, rank)
+	copy(fullConfig, axesConfig)
 	tensor := opNode.tensor
 	currentShape := toInt64Slice(opNode.shape.Dimensions)
 
 	// Step 1: Handle interior padding per axis by reshaping [N] -> [N, 1],
 	// padding the new axis with ac.Interior, flattening to [N*(ac.Interior+1)],
 	// and slicing to [(N-1)*ac.Interior + N].
-	for i, ac := range axesConfig {
+	for i, ac := range fullConfig {
 		if ac.Interior > 0 {
 			n := currentShape[i]
 			if n > 1 {
@@ -1764,7 +1766,7 @@ func (f *Function) Pad(operand, fillValue compute.Value, axesConfig ...compute.P
 	hasPad := false
 	padBefore := make([]int64, rank)
 	padAfter := make([]int64, rank)
-	for i, ac := range axesConfig {
+	for i, ac := range fullConfig {
 		if ac.Start > 0 {
 			padBefore[i] = int64(ac.Start)
 			hasPad = true
@@ -1789,7 +1791,7 @@ func (f *Function) Pad(operand, fillValue compute.Value, axesConfig ...compute.P
 	cropStarts := make([]int64, rank)
 	cropEnds := make([]int64, rank)
 	cropStrides := make([]int64, rank)
-	for i, ac := range axesConfig {
+	for i, ac := range fullConfig {
 		cropStrides[i] = 1
 		cropEnds[i] = currentShape[i]
 		if ac.Start < 0 {
