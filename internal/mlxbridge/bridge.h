@@ -188,6 +188,9 @@ int32_t mlx_tape_add_parameter(MLXTapeHandle tape, int dtype,
 int32_t mlx_tape_add_constant(MLXTapeHandle tape, const void* data, int64_t nbytes,
     int dtype, const int32_t* shape, int rank, MLXError* error);
 
+// Records an existing MLXArrayHandle as a constant node in the tape without copying its unified memory data.
+int32_t mlx_tape_add_constant_array(MLXTapeHandle tape, MLXArrayHandle arr, MLXError* error);
+
 // Records a unary operation (MLXUnaryOp) on input node ID.
 int32_t mlx_tape_add_unary(MLXTapeHandle tape, int op, int32_t input, MLXError* error);
 

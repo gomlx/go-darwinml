@@ -151,6 +151,9 @@ func (t *Tape) AddParameter(dtype DType, shape []int) (NodeID, error) { return -
 func (t *Tape) AddConstant(data unsafe.Pointer, nbytes int64, dtype DType, shape []int) (NodeID, error) {
 	return -1, errNoCGo
 }
+func (t *Tape) AddConstantArray(arr ArrayHandle) (NodeID, error) {
+	return -1, errNoCGo
+}
 func (t *Tape) AddUnary(op UnaryOp, input NodeID) (NodeID, error)             { return -1, errNoCGo }
 func (t *Tape) AddBinary(op BinaryOp, lhs, rhs NodeID) (NodeID, error)        { return -1, errNoCGo }
 func (t *Tape) AddConvertDType(input NodeID, targetDType DType) (NodeID, error) { return -1, errNoCGo }
