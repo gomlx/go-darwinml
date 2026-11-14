@@ -7,6 +7,43 @@ Currently implemented backends:
 - **`mps`** (`./compute/mps`): Apple Metal Performance Shaders Graph (`MPSGraph`) GPU backend.
 - **`mlx`** (`./compute/mlx`): Apple [MLX](https://github.com/ml-explore/mlx) (`mlx::core`) GPU backend (supports both `"mlx"` compiled static execution and `"mlx:dynamic"` native dynamic-shape execution).
 
+## Related Repositories (including this one)
+
+- **[`github.com/gomlx/gomlx`](https://github.com/gomlx/gomlx)**: High-level ML framework in Go (tensors, layers, automatic differentiation, optimizers, model training loops). GoMLX delegates lower-level graph compilation and execution to a `compute.Backend`.
+- **[`github.com/gomlx/compute`](https://github.com/gomlx/compute)**: Foundational execution and backend abstraction interface (`compute.Backend`, `compute.Builder`, `compute.Function`, `compute.Executable`, `compute.Buffer`), shared `dtypes`, `shapes`, `shapeinference`, and backend compliance tests (`compute/support/backendtest`).
+  - It also includes the "go" backend: written in pure Go, portable (including WASM), optionally supporting SIMD.
+- **`github.com/gomlx/go-xla`**: Depends **only** on `github.com/gomlx/compute` (never on `github.com/gomlx/gomlx`, to avoid circular dependencies).
+- **`github.com/gomlx/compute-onnx`**: Implements a ONNX Runtime (ORT) based backend. Supports Dynamic Shapes. Depends **only** on `github.com/gomlx/compute`
+- **`github.com/gomlx/go-darwinml`**: Implements the "mps" (Apple's MPSGraph based) and "mlx" (Apple's MLX based) backends. Depends **only** on `github.com/gomlx/compute`.
+- **`github.com/gomlx/onnx-gomlx`**: Converts `.onnx` models to GoMLX models. 
+- **`github.com/gomlx/go-huggingface`**: Hugging Face models tools: download repo files, iterate over datasets, tokenizer implementations, model implementations (using GoMLX). Currently it supports only a subset of the models ( mainly LLMs for text generation and instruction following) but is expandable.
+
+When navigating the codebase of any of the related projects, read their .agents/AGENTS.md file to get more information about
+the structure of the codebase and their specific conventions.
+
+## Documentation & Git Workflow
+
+- Record user-visible or API changes in `docs/CHANGELOG.md` (with `docs/CHANGELOG-pjrt.md` and `docs/CHANGELOG-stablehlo.md` kept as historical archives).
+- Keep `.agents/AGENTS.md` (symlinked from `GEMINI.md`) updated whenever architecture, conventions, or non-obvious behavior changes.
+- **Never `git commit` or `git push`** without explicit user instruction; leave changes uncommitted in the working tree for review.
+- When changing code, if not explicitly asked, always wait for the operator to review the changes before committing them.
+
+## Coding Style & Dependencies
+
+- **Minimal External Dependencies (No Testify)**: Do **not** add external test libraries such as `github.com/stretchr/testify`. Use standard `testing` (`t.Fatalf`, `t.Errorf`, `t.Run`) and `github.com/gomlx/compute/support/testutil`. Note that `cmd/pjrt_installer` has its own `go.mod` specifically to isolate interactive TUI (`charmbracelet/*`) dependencies from the main `go-xla` module.
+- **Error Handling**: Wrap errors with stack traces using `github.com/pkg/errors` (`errors.Errorf`, `errors.Wrapf`, `errors.WithMessagef`) and format with `"%+v"` when logging stack traces. In `compute/xla`, wrap unsupported ops or option combinations with `compute.ErrNotImplemented` so GoMLX and `backendtest` can fall back or skip cleanly.
+- **Follow Existing Patterns**: Before writing new code, read neighboring files in the same package to match established conventions (arena usage, `runtime.AddCleanup` / `runtime.KeepAlive`, `verifyAndCastValues`, closure caching, etc.).
+- **Avoid Large Files (Split Per-Op Implementations > 200 Lines)**: Keep files focused so directory listings stay scannable. Place complex op families (> ~200 lines, e.g., `ops_dotgeneral.go`, `ops_reduce.go`, `ops_scatter.go`, `flash.go`) in dedicated files rather than growing a monolith.
+- **Copyright Notes**: Normal source files start with:
+  ```go
+  // Copyright 2023-2026 The GoMLX Authors. SPDX-License-Identifier: Apache-2.0
+  ```
+  Auto-generated files (`gen_*`) omit the copyright header and instead carry a comment identifying the generator tool.
+
+### Compliance Tests, Unit Tests & Benchmarks
+
+- Generic backend tests and benchmarks belong in `github.com/gomlx/compute/support/backendtest` (`TestCompliance` and `BenchmarkCompliance` in `compute/xla/xla_test.go` invoke `backendtest.RunAll` and `backendtest.RunAllBenchmarks`).
+
 ## Repository Layout
 - `./compute/mlx/`: Implementation of `compute.Backend`, `compute.Builder`, `compute.Function`, `compute.Executable`, and `compute.Buffer` for the `"mlx"` backend (see [`docs/MLX.md`](../docs/MLX.md)).
   - `register_darwin.go` / `nocgo_darwin.go` / `stub_other.go`: Platform build tags and registration (`compute.Register("mlx", New)`).
