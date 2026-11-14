@@ -8,6 +8,7 @@ import (
 	"slices"
 
 	"github.com/gomlx/compute"
+	"github.com/gomlx/compute/dtypes"
 	"github.com/gomlx/compute/shapeinference"
 	"github.com/gomlx/compute/shapes"
 	"github.com/gomlx/go-darwinml/internal/bridge"
@@ -42,6 +43,9 @@ func (f *Function) Gather(
 		startIndexMap, sliceSizes, indicesAreSorted)
 	if err != nil {
 		return nil, errors.Wrap(err, "Gather")
+	}
+	if outShape.Size() == 0 {
+		return &graphNode{tensor: nil, shape: outShape, owner: f}, nil
 	}
 
 	// Try fast path: simple embedding lookup along a single axis.
@@ -151,6 +155,21 @@ func (f *Function) gatherEmbeddingLookup(
 		return nil, false
 	}
 
+	// Clamp indices to [0, operandDim - 1] per XLA Gather semantics.
+	maxIdx := max(0, operandNode.shape.Dimensions[gatherAxis]-1)
+	zeroConst, err := f.makeScalarConst(0, indicesNode.shape.DType)
+	if err != nil {
+		return nil, false
+	}
+	maxConst, err := f.makeScalarConst(float64(maxIdx), indicesNode.shape.DType)
+	if err != nil {
+		return nil, false
+	}
+	idxTensor, err = f.ctx().Clamp(zeroConst, idxTensor, maxConst)
+	if err != nil {
+		return nil, false
+	}
+
 	// Broadcast indices to match the gatherAlongAxis output shape:
 	// same as operand but with gatherAxis replaced by the batch size.
 	broadcastShape := make([]int64, operandRank)
@@ -239,6 +258,78 @@ func (f *Function) gatherGeneral(
 		return nil, errors.Wrap(err, "Gather: reshape indices")
 	}
 
+	// Clamp start indices to [0, max(0, operandDim - sliceSize)] per XLA Gather semantics,
+	// and expand multi-element windows (sliceSizes[origAxis] > 1) on indexed axes.
+	winTotal := 1
+	if indexVectorSize > 0 {
+		minVec := make([]int32, indexVectorSize)
+		maxVec := make([]int32, indexVectorSize)
+		winDims := make([]int, indexVectorSize)
+		for k, origAxis := range startIndexMap {
+			maxVec[k] = int32(max(0, operandShape.Dimensions[origAxis]-sliceSizes[origAxis]))
+			winDims[k] = sliceSizes[origAxis]
+			winTotal *= winDims[k]
+		}
+		minNode, err := f.Constant(minVec, 1, indexVectorSize)
+		if err != nil {
+			return nil, errors.Wrap(err, "Gather: min clamp constant")
+		}
+		maxNode, err := f.Constant(maxVec, 1, indexVectorSize)
+		if err != nil {
+			return nil, errors.Wrap(err, "Gather: max clamp constant")
+		}
+		minTensor := minNode.(*graphNode).tensor
+		maxTensor := maxNode.(*graphNode).tensor
+		if indicesShape.DType != dtypes.Int32 {
+			minTensor, err = f.ctx().Cast(minTensor, dtypeToBridgeDType(indicesShape.DType))
+			if err != nil {
+				return nil, errors.Wrap(err, "Gather: cast min clamp")
+			}
+			maxTensor, err = f.ctx().Cast(maxTensor, dtypeToBridgeDType(indicesShape.DType))
+			if err != nil {
+				return nil, errors.Wrap(err, "Gather: cast max clamp")
+			}
+		}
+		idxTensor, err = f.ctx().Clamp(minTensor, idxTensor, maxTensor)
+		if err != nil {
+			return nil, errors.Wrap(err, "Gather: clamp indices")
+		}
+
+		if winTotal > 1 {
+			offsets := make([]int32, winTotal*indexVectorSize)
+			for w := range winTotal {
+				rem := w
+				for k := indexVectorSize - 1; k >= 0; k-- {
+					offsets[w*indexVectorSize+k] = int32(rem % winDims[k])
+					rem /= winDims[k]
+				}
+			}
+			offNode, err := f.Constant(offsets, 1, winTotal, indexVectorSize)
+			if err != nil {
+				return nil, errors.Wrap(err, "Gather: window offsets constant")
+			}
+			offTensor := offNode.(*graphNode).tensor
+			if indicesShape.DType != dtypes.Int32 {
+				offTensor, err = f.ctx().Cast(offTensor, dtypeToBridgeDType(indicesShape.DType))
+				if err != nil {
+					return nil, errors.Wrap(err, "Gather: cast window offsets")
+				}
+			}
+			idxTensor, err = f.ctx().Reshape(idxTensor, []int64{int64(batchSize), 1, int64(indexVectorSize)})
+			if err != nil {
+				return nil, errors.Wrap(err, "Gather: reshape indices for window expansion")
+			}
+			idxTensor, err = f.ctx().Add(idxTensor, offTensor)
+			if err != nil {
+				return nil, errors.Wrap(err, "Gather: add window offsets")
+			}
+			idxTensor, err = f.ctx().Reshape(idxTensor, []int64{int64(batchSize * winTotal), int64(indexVectorSize)})
+			if err != nil {
+				return nil, errors.Wrap(err, "Gather: flatten expanded window indices")
+			}
+		}
+	}
+
 	// General strategy: transpose operand so that startIndexMap axes come first,
 	// then use gatherND on the transposed operand.
 	perm := make([]int, operandRank)
@@ -282,7 +373,7 @@ func (f *Function) gatherGeneral(
 	}
 
 	// Post-GatherND: trim non-collapsed, non-indexed axes where sliceSizes < full dimension.
-	// The GatherND result has shape [batchSize, <remaining transposed operand dims>].
+	// The GatherND result has shape [batchSize * winTotal, <remaining transposed operand dims>].
 	// The remaining axes correspond to perm[len(startIndexMap):].
 	needsSlice := false
 	for k := len(startIndexMap); k < operandRank; k++ {
@@ -294,13 +385,13 @@ func (f *Function) gatherGeneral(
 	}
 	if needsSlice {
 		// Build starts/ends/strides for the slice.
-		// Axis 0 is the batch dimension, kept fully.
+		// Axis 0 is the flattened batch*window dimension, kept fully.
 		sliceRank := 1 + (operandRank - len(startIndexMap))
 		starts := make([]int64, sliceRank)
 		ends := make([]int64, sliceRank)
 		strides := make([]int64, sliceRank)
 		starts[0] = 0
-		ends[0] = int64(batchSize)
+		ends[0] = int64(batchSize * winTotal)
 		strides[0] = 1
 		for k := len(startIndexMap); k < operandRank; k++ {
 			si := 1 + k - len(startIndexMap)
@@ -319,10 +410,9 @@ func (f *Function) gatherGeneral(
 		}
 	}
 
-	// Currently result has shape [batchSize, rem_0, rem_1, ...] where rem_j corresponds
+	// Currently result has shape [batchSize * winTotal, rem_0, rem_1, ...] where rem_j corresponds
 	// to original operand axis perm[len(startIndexMap)+j].
-	// First, reshape to expand batchDims and drop any collapsedSliceAxes among the remaining axes,
-	// while keeping non-collapsed offset axes in their original operand order.
+	// First, reshape to expand [batchDims..., indexedNonCollapsedDims..., remNonCollapsedDims...].
 	var offsetOrigAxes []int
 	for i := range operandRank {
 		if !collapsedSet[i] {
@@ -330,10 +420,12 @@ func (f *Function) gatherGeneral(
 		}
 	}
 
-	// Check if remaining non-collapsed axes in perm[len(startIndexMap):] are already in ascending order.
-	// Note: any axis in startIndexMap that is NOT in collapsedSet was consumed by GatherND (since GatherND collapses indexed axes),
-	// so if any axis in startIndexMap is not collapsed and has sliceSizes[a] == 1, it is a size-1 offset axis.
 	var gatherNDOffsetOrigAxes []int
+	for _, origAxis := range startIndexMap {
+		if !collapsedSet[origAxis] {
+			gatherNDOffsetOrigAxes = append(gatherNDOffsetOrigAxes, origAxis)
+		}
+	}
 	for k := len(startIndexMap); k < operandRank; k++ {
 		origAxis := perm[k]
 		if !collapsedSet[origAxis] {
@@ -341,24 +433,13 @@ func (f *Function) gatherGeneral(
 		}
 	}
 
-	// Reshape result from [batchSize, ...] to [batchDims..., gatherNDOffsetDims...].
+	// Reshape result from [batchSize * winTotal, ...] to [batchDims..., gatherNDOffsetDims...].
 	intermediateDims := make([]int64, 0, len(batchDims)+len(offsetOrigAxes))
 	for _, d := range batchDims {
 		intermediateDims = append(intermediateDims, int64(d))
 	}
 	for _, origAxis := range gatherNDOffsetOrigAxes {
 		intermediateDims = append(intermediateDims, int64(sliceSizes[origAxis]))
-	}
-	// If there are indexed axes that were NOT collapsed (so they have sliceSizes == 1), append size 1 for them,
-	// and record their original axis so we can permute them into place.
-	for _, origAxis := range startIndexMap {
-		if !collapsedSet[origAxis] {
-			if sliceSizes[origAxis] > 1 {
-				return nil, errors.Wrapf(compute.ErrNotImplemented, "Gather: sliceSizes[%d]=%d > 1 on indexed axis not supported in %q backend", origAxis, sliceSizes[origAxis], BackendName)
-			}
-			gatherNDOffsetOrigAxes = append(gatherNDOffsetOrigAxes, origAxis)
-			intermediateDims = append(intermediateDims, 1)
-		}
 	}
 	result, err = f.ctx().Reshape(result, intermediateDims)
 	if err != nil {

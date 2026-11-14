@@ -222,6 +222,9 @@ func (t *Tape) AddSoftmax(input NodeID, axis int) (NodeID, error) { return -1, e
 func (t *Tape) AddLayerNorm(input, gamma, beta NodeID, eps float32) (NodeID, error) {
 	return -1, errNoCGo
 }
+func (t *Tape) AddNonZero(operand NodeID, transpose bool) (NodeID, error) {
+	return -1, errNoCGo
+}
 func (t *Tape) Compile(outputIDs []NodeID, compileGraph, eagerContiguous bool) (*Exec, error) {
 	return nil, errNoCGo
 }

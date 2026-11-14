@@ -248,4 +248,10 @@ MPSGraphTensorHandle mpsgraph_scatter_along_axis(MPSGraphContextHandle ctx,
     MPSGraphTensorHandle data, MPSGraphTensorHandle indices, MPSGraphTensorHandle updates,
     int axis, int mode, MPSGraphError* error);
 
+// --- TopK / BottomK ---
+bool mpsgraph_top_k(MPSGraphContextHandle ctx,
+    MPSGraphTensorHandle source, int axis, int k, bool smallest,
+    MPSGraphTensorHandle* outValues, MPSGraphTensorHandle* outIndices,
+    MPSGraphError* error);
+
 #endif // MPSGRAPH_BRIDGE_H

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gomlx/compute"
 	"github.com/gomlx/compute/shapes"
@@ -22,14 +23,20 @@ const BackendName = "mlx"
 
 // Backend implements the compute.Backend interface using Apple's MLX framework.
 type Backend struct {
-	deviceName      string
-	mlxVersion      string
-	dynamicShapes   bool
-	eagerContiguous bool
-	capabilities    compute.Capabilities
+	deviceName       string
+	mlxVersion       string
+	dynamicShapes    bool
+	eagerContiguous  bool
+	capabilities     compute.Capabilities
+	uniqueAxisNameID atomic.Uint64
 
 	mu          sync.RWMutex
 	isFinalized bool
+}
+
+// UniqueAxisName returns a name derived from base that is unique across this backend.
+func (b *Backend) UniqueAxisName(base string) string {
+	return fmt.Sprintf("%s_%d", base, b.uniqueAxisNameID.Add(1))
 }
 
 // Verify interface compliance.
@@ -104,6 +111,7 @@ func New(config string) (compute.Backend, error) {
 	if dynamicShapes {
 		caps.DynamicAxes = true
 		caps.DynamicShapes = compute.DynamicShapesNative
+		caps.Operations[compute.OpTypeNonZero] = true
 	}
 
 	return &Backend{

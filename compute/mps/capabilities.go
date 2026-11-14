@@ -140,6 +140,7 @@ var backendCapabilities = compute.Capabilities{
 		compute.OpTypeFusedDense:                     true,
 		compute.OpTypeFusedAttentionQKVProjection:    true,
 		compute.OpTypeFusedScaledDotProductAttention: true,
+		compute.OpTypeFusedTopK:                      true,
 
 		// Batch normalization (training)
 		compute.OpTypeBatchNormForTraining: true,

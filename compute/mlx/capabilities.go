@@ -150,6 +150,7 @@ var baseCapabilities = compute.Capabilities{
 		compute.OpTypeFusedDense:                     true,
 		compute.OpTypeFusedAttentionQKVProjection:    true,
 		compute.OpTypeFusedScaledDotProductAttention: true,
+		compute.OpTypeFusedTopK:                      true,
 	},
 
 	DTypes: map[dtypes.DType]bool{

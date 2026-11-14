@@ -10,6 +10,7 @@ import (
 	"github.com/gomlx/compute"
 	"github.com/gomlx/compute/dtypes"
 	"github.com/gomlx/compute/shapes"
+	"github.com/gomlx/go-darwinml/internal/mlxbridge"
 	"github.com/pkg/errors"
 )
 
@@ -73,6 +74,12 @@ func (f *Function) DotGeneral(
 	if err != nil {
 		return nil, errors.Wrap(err, "DotGeneral")
 	}
+	outShape = f.nameAnonymousDynamicAxes(outShape, "#dot")
+	makeOut := func(id mlxbridge.NodeID) *graphNode {
+		n := &graphNode{id: id, shape: outShape, owner: f}
+		f.registerDynamicAxes(n)
+		return n
+	}
 
 	// Determine computation dtype.
 	computeDType := inputDType
@@ -106,7 +113,7 @@ func (f *Function) DotGeneral(
 				return nil, errors.Wrap(err, "DotGeneral: convert output")
 			}
 		}
-		return &graphNode{id: resID, shape: outShape, owner: f}, nil
+		return makeOut(resID), nil
 	}
 	if isTransposedRhsMatMul(lhsNode.shape, lhsContracting, lhsBatch, rhsNode.shape, rhsContracting, rhsBatch) {
 		rRank := rhsNode.shape.Rank()
@@ -129,7 +136,7 @@ func (f *Function) DotGeneral(
 				return nil, errors.Wrap(err, "DotGeneral: convert output")
 			}
 		}
-		return &graphNode{id: resID, shape: outShape, owner: f}, nil
+		return makeOut(resID), nil
 	}
 
 	// General path: normalize to 2D [M, K] x [K, N] (when len(lhsBatch) == 0)
@@ -167,7 +174,7 @@ func (f *Function) DotGeneral(
 				return nil, errors.Wrap(err, "DotGeneral: convert output")
 			}
 		}
-		return &graphNode{id: resID, shape: outShape, owner: f}, nil
+		return makeOut(resID), nil
 	}
 
 	hasBatch := len(lhsBatch) > 0
@@ -276,7 +283,7 @@ func (f *Function) DotGeneral(
 		}
 	}
 
-	return &graphNode{id: resID, shape: outShape, owner: f}, nil
+	return makeOut(resID), nil
 }
 
 func normalizeAxes(opName string, axes []int, rank int) ([]int, error) {

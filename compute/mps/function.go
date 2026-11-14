@@ -306,6 +306,10 @@ func (f *Function) Parameter(name string, shape shapes.Shape, sharding *compute.
 	if err := checkDTypeSupported(shape.DType); err != nil {
 		return nil, errors.Wrapf(err, "Parameter(%s)", name)
 	}
+	if shape.IsDynamic() {
+		return nil, errors.Wrapf(compute.ErrNotImplemented,
+			"Parameter(%q): dynamic shape %s is not supported in %q backend", name, shape, BackendName)
+	}
 	dims := toInt64Slice(shape.Dimensions)
 	dtype := dtypeToBridgeDType(shape.DType)
 	tensor, err := f.ctx().Placeholder(dtype, dims)
@@ -1009,6 +1013,10 @@ func (f *Function) Reshape(x compute.Value, dimensions ...int) (compute.Value, e
 		return nil, errors.Wrap(err, "Reshape")
 	}
 	outShape := shapes.Make(node.shape.DType, dimensions...)
+	if outShape.IsDynamic() {
+		return nil, errors.Wrapf(compute.ErrNotImplemented,
+			"Reshape: dynamic shape %s is not supported in %q backend", outShape, BackendName)
+	}
 	dims := toInt64Slice(dimensions)
 	tensor, err := f.ctx().Reshape(node.tensor, dims)
 	if err != nil {
@@ -1051,6 +1059,10 @@ func (f *Function) ConvertDType(x compute.Value, dtype dtypes.DType) (compute.Va
 }
 
 func (f *Function) BroadcastInDim(x compute.Value, outputShape shapes.Shape, broadcastAxes []int) (compute.Value, error) {
+	if outputShape.IsDynamic() {
+		return nil, errors.Wrapf(compute.ErrNotImplemented,
+			"BroadcastInDim: dynamic shape %s is not supported in %q backend", outputShape, BackendName)
+	}
 	node, err := f.resolveNode(x)
 	if err != nil {
 		return nil, errors.Wrap(err, "BroadcastInDim")
@@ -1170,6 +1182,10 @@ func (f *Function) Reverse(x compute.Value, axes ...int) (compute.Value, error) 
 func (f *Function) Iota(shape shapes.Shape, iotaAxis int) (compute.Value, error) {
 	if err := checkDTypeSupported(shape.DType); err != nil {
 		return nil, errors.Wrap(err, "Iota")
+	}
+	if shape.IsDynamic() {
+		return nil, errors.Wrapf(compute.ErrNotImplemented,
+			"Iota: dynamic shape %s is not supported in %q backend", shape, BackendName)
 	}
 	dims := toInt64Slice(shape.Dimensions)
 	dtype := dtypeToBridgeDType(shape.DType)
@@ -1912,6 +1928,10 @@ func (f *Function) RNGBitGenerator(state compute.Value, shape shapes.Shape) (new
 	}
 	if err := checkDTypeSupported(shape.DType); err != nil {
 		return nil, nil, errors.Wrap(err, "RNGBitGenerator")
+	}
+	if shape.IsDynamic() {
+		return nil, nil, errors.Wrapf(compute.ErrNotImplemented,
+			"RNGBitGenerator: dynamic shape %s is not supported in %q backend", shape, BackendName)
 	}
 
 	dims := toInt64Slice(shape.Dimensions)
@@ -4080,4 +4100,38 @@ func (f *Function) FusedAttentionQKVProjection(
 	}
 
 	return query, key, value, nil
+}
+
+// FusedTopK returns sorted values and Int32 indices of the k largest (or smallest when cfg.Smallest is true)
+// elements along cfg.Axis. Ties prefer the lower original index.
+func (f *Function) FusedTopK(operand compute.Value, k int, cfg compute.FusedTopKConfig) (values, indices compute.Value, err error) {
+	opNode, err := f.resolveNode(operand)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "FusedTopK")
+	}
+	valuesShape, indicesShape, err := shapeinference.FusedTopK(opNode.shape, k, cfg)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "FusedTopK")
+	}
+	if err := checkDTypeSupported(opNode.shape.DType); err != nil {
+		return nil, nil, errors.Wrap(err, "FusedTopK")
+	}
+	if valuesShape.Size() == 0 {
+		return &graphNode{tensor: nil, shape: valuesShape, owner: f},
+			&graphNode{tensor: nil, shape: indicesShape, owner: f},
+			nil
+	}
+
+	axis := cfg.Axis
+	if axis < 0 {
+		axis += opNode.shape.Rank()
+	}
+
+	valTensor, idxTensor, err := f.ctx().TopK(opNode.tensor, axis, k, cfg.Smallest)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "FusedTopK")
+	}
+	return &graphNode{tensor: valTensor, shape: valuesShape, owner: f},
+		&graphNode{tensor: idxTensor, shape: indicesShape, owner: f},
+		nil
 }
