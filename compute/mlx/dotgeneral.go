@@ -74,7 +74,6 @@ func (f *Function) DotGeneral(
 	if err != nil {
 		return nil, errors.Wrap(err, "DotGeneral")
 	}
-	outShape = f.nameAnonymousDynamicAxes(outShape, "#dot")
 	makeOut := func(id mlxbridge.NodeID) *graphNode {
 		n := &graphNode{id: id, shape: outShape, owner: f}
 		f.registerDynamicAxes(n)
@@ -349,7 +348,11 @@ func dotGeneralOutputShape(
 		ra := rhsBatchAxes[i]
 		ld := lhsShape.Dimensions[la]
 		rd := rhsShape.Dimensions[ra]
-		if ld != shapes.DynamicDim && rd != shapes.DynamicDim && ld != rd {
+		if ld == shapes.DynamicDim && rd == shapes.DynamicDim {
+			if !shapes.AxisNamesCompatible(lhsShape.AxisName(la), rhsShape.AxisName(ra)) {
+				return shapes.Invalid(), errors.Errorf("DotGeneral: batch axis %d axis name conflict (%q vs %q)", i, lhsShape.AxisName(la), rhsShape.AxisName(ra))
+			}
+		} else if ld != shapes.DynamicDim && rd != shapes.DynamicDim && ld != rd {
 			return shapes.Invalid(), errors.Errorf("DotGeneral: batch axis %d dimension mismatch (%d vs %d)", i, ld, rd)
 		}
 	}
@@ -357,7 +360,11 @@ func dotGeneralOutputShape(
 		ra := rhsContractingAxes[i]
 		ld := lhsShape.Dimensions[la]
 		rd := rhsShape.Dimensions[ra]
-		if ld != shapes.DynamicDim && rd != shapes.DynamicDim && ld != rd {
+		if ld == shapes.DynamicDim && rd == shapes.DynamicDim {
+			if !shapes.AxisNamesCompatible(lhsShape.AxisName(la), rhsShape.AxisName(ra)) {
+				return shapes.Invalid(), errors.Errorf("DotGeneral: contracting axis %d axis name conflict (%q vs %q)", i, lhsShape.AxisName(la), rhsShape.AxisName(ra))
+			}
+		} else if ld != shapes.DynamicDim && rd != shapes.DynamicDim && ld != rd {
 			return shapes.Invalid(), errors.Errorf("DotGeneral: contracting axis %d dimension mismatch (%d vs %d)", i, ld, rd)
 		}
 	}
@@ -366,10 +373,19 @@ func dotGeneralOutputShape(
 	var names []string
 	hasNames := lhsShape.AxisNames != nil || rhsShape.AxisNames != nil
 
-	for _, a := range lhsBatchAxes {
-		dims = append(dims, lhsShape.Dimensions[a])
+	for i, a := range lhsBatchAxes {
+		ra := rhsBatchAxes[i]
+		if lhsShape.Dimensions[a] == shapes.DynamicDim || rhsShape.Dimensions[ra] == shapes.DynamicDim {
+			dims = append(dims, shapes.DynamicDim)
+		} else {
+			dims = append(dims, lhsShape.Dimensions[a])
+		}
 		if hasNames {
-			names = append(names, lhsShape.AxisName(a))
+			unified, err := shapes.UnifyAxisName(lhsShape.AxisName(a), rhsShape.AxisName(ra))
+			if err != nil {
+				return shapes.Invalid(), errors.Wrapf(err, "DotGeneral batch axis %d", i)
+			}
+			names = append(names, unified)
 		}
 	}
 	for i := range lhsShape.Rank() {

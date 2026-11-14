@@ -98,7 +98,7 @@ func (e *Executable) Execute(inputs []compute.Buffer, donate []bool, defaultDevi
 				return nil, errors.Errorf("Execute: input #%d dimension %d mismatch: expected %s, got %s",
 					i, ax, expected, bufShape)
 			}
-			if name := expected.AxisName(ax); name != "" && name != shapes.AnonymousAxis {
+			if name := expected.AxisName(ax); name != "" {
 				if boundAxes == nil {
 					boundAxes = make(map[string]int)
 				}
