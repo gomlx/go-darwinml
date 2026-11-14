@@ -60,6 +60,9 @@ func (c *Context) Placeholder(dtype DType, shape []int64) (Tensor, error)   { re
 func (c *Context) Constant(data unsafe.Pointer, nbytes int64, dtype DType, shape []int64) (Tensor, error) {
 	return nil, errNoCGo
 }
+func (c *Context) ConstantFromBuffer(buf *Buffer, nbytes int64, dtype DType, shape []int64) (Tensor, error) {
+	return nil, errNoCGo
+}
 func (c *Context) Iota(dtype DType, shape []int64, axis int) (Tensor, error) { return nil, errNoCGo }
 
 func (c *Context) Abs(x Tensor) (Tensor, error)        { return nil, errNoCGo }

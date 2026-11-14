@@ -149,6 +149,52 @@ func (f *Function) Constant(flat any, dimensions ...int) (compute.Value, error) 
 	}, nil
 }
 
+// ConstantFromBuffer creates a constant in the function backed by buf without copying unified memory data.
+func (f *Function) ConstantFromBuffer(buf compute.Buffer, donate bool) (compute.Value, error) {
+	if buf == nil {
+		return nil, errors.New("ConstantFromBuffer: buffer is nil")
+	}
+	mlxBuf, ok := buf.(*Buffer)
+	if !ok {
+		return nil, errors.Errorf("ConstantFromBuffer: buffer (%T) does not belong to backend %q", buf, BackendName)
+	}
+	if mlxBuf.backend != f.builder.backend {
+		return nil, errors.New("ConstantFromBuffer: buffer belongs to a different backend instance")
+	}
+
+	mlxBuf.mu.Lock()
+	if !mlxBuf.valid {
+		mlxBuf.mu.Unlock()
+		return nil, errors.New("ConstantFromBuffer: buffer has been finalized")
+	}
+	shape := mlxBuf.shape.Clone()
+	arr := mlxBuf.handle.load()
+	mlxBuf.mu.Unlock()
+
+	if err := f.builder.backend.checkDTypeSupported(shape.DType); err != nil {
+		return nil, err
+	}
+	var id mlxbridge.NodeID
+	var err error
+	if arr == 0 || shape.IsZeroSize() {
+		id, err = f.builder.tape.AddConstant(nil, 0, dtypeToBridgeDType(shape.DType), shape.Dimensions)
+	} else {
+		id, err = f.builder.tape.AddConstantArray(arr)
+	}
+	runtime.KeepAlive(mlxBuf)
+	if err != nil {
+		return nil, errors.Wrap(err, "ConstantFromBuffer")
+	}
+	if donate {
+		_ = mlxBuf.Finalize()
+	}
+	return &graphNode{
+		id:    id,
+		shape: shape,
+		owner: f,
+	}, nil
+}
+
 // Return marks the outputs of this function.
 func (f *Function) Return(outputs []compute.Value, _ []*compute.ShardingSpec) error {
 	if f.returned {

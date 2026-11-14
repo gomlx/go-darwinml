@@ -190,6 +190,25 @@ func (c *Context) Constant(data unsafe.Pointer, nbytes int64, dtype DType, shape
 	return Tensor(t), nil
 }
 
+// ConstantFromBuffer creates a constant tensor backed directly by a unified-memory MTLBuffer without copying.
+func (c *Context) ConstantFromBuffer(buf *Buffer, nbytes int64, dtype DType, shape []int64) (Tensor, error) {
+	var cErr C.MPSGraphError
+	var shapePtr *C.int64_t
+	if len(shape) > 0 {
+		shapePtr = (*C.int64_t)(unsafe.Pointer(&shape[0]))
+	}
+	var bufH C.MTLBufferHandle
+	if buf != nil {
+		bufH = buf.handle
+	}
+	t := C.mpsgraph_constant_from_buffer(c.handle, bufH, C.int64_t(nbytes), C.int(dtype), shapePtr, C.int(len(shape)), &cErr)
+	runtime.KeepAlive(buf)
+	if err := extractError(cErr); err != nil {
+		return nil, err
+	}
+	return Tensor(t), nil
+}
+
 // Iota creates a tensor with sequential values along the specified axis.
 func (c *Context) Iota(dtype DType, shape []int64, axis int) (Tensor, error) {
 	var cErr C.MPSGraphError

@@ -234,6 +234,37 @@ MPSGraphTensorHandle mpsgraph_constant(MPSGraphContextHandle handle, void* data,
     }
 }
 
+MPSGraphTensorHandle mpsgraph_constant_from_buffer(MPSGraphContextHandle handle, MTLBufferHandle bufH,
+    int64_t nbytes, int dtype, int64_t* shape, int rank, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        if (!bufH) {
+            setError(error, 11, @"Failed to create constant tensor: null buffer");
+            return NULL;
+        }
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        id<MTLBuffer> mtlBuf = (__bridge id<MTLBuffer>)bufH;
+        NSArray<NSNumber*>* shapeArr = shapeArray(shape, rank);
+        MPSDataType mpsType = toMPSDataType(dtype);
+        NSData* nsData = [NSData dataWithBytesNoCopy:mtlBuf.contents
+                                              length:(NSUInteger)nbytes
+                                         deallocator:^(void* bytes, NSUInteger length) {
+                                             (void)bytes;
+                                             (void)length;
+                                             (void)mtlBuf; // ARC retains mtlBuf until NSData is released
+                                         }];
+
+        MPSGraphTensor* tensor = [ctx.graph constantWithData:nsData
+                                                       shape:shapeArr
+                                                    dataType:mpsType];
+        if (!tensor) {
+            setError(error, 11, @"Failed to create constant tensor from buffer");
+            return NULL;
+        }
+        return (__bridge void*)tensor;
+    }
+}
+
 MPSGraphTensorHandle mpsgraph_iota(MPSGraphContextHandle handle, int dtype,
     int64_t* shape, int rank, int axis, MPSGraphError* error) {
     @autoreleasepool {

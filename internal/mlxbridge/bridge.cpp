@@ -1706,6 +1706,36 @@ int32_t mlx_tape_add_constant(MLXTapeHandle handle, const void* src, int64_t nby
     }
 }
 
+int32_t mlx_tape_add_constant_array(MLXTapeHandle handle, MLXArrayHandle arr_handle, MLXError* error) {
+    clearError(error);
+    if (!handle) {
+        setError(error, 1, "mlx_tape_add_constant_array: null tape handle");
+        return -1;
+    }
+    if (!arr_handle) {
+        setError(error, 2, "mlx_tape_add_constant_array: null array handle");
+        return -1;
+    }
+    try {
+        auto* tape = static_cast<MLXTape*>(handle);
+        const auto* src = reinterpret_cast<const mlx::core::array*>(arr_handle);
+        int const_idx = static_cast<int>(tape->constants.size());
+        tape->constants.push_back(*src);
+
+        int32_t node_id = static_cast<int32_t>(tape->nodes.size());
+        TapeNode node;
+        node.kind = TapeOpKind::Constant;
+        node.index = const_idx;
+        node.dtype = src->dtype();
+        node.shape = src->shape();
+        tape->nodes.push_back(std::move(node));
+        return node_id;
+    } catch (const std::exception& e) {
+        setError(error, 4, std::string("mlx_tape_add_constant_array: ") + e.what());
+        return -1;
+    }
+}
+
 int32_t mlx_tape_add_unary(MLXTapeHandle handle, int op, int32_t input, MLXError* error) {
     clearError(error);
     if (!handle) {

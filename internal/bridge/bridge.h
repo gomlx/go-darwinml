@@ -56,6 +56,8 @@ MPSGraphTensorHandle mpsgraph_placeholder(MPSGraphContextHandle ctx, int dtype,
     int64_t* shape, int rank, MPSGraphError* error);
 MPSGraphTensorHandle mpsgraph_constant(MPSGraphContextHandle ctx, void* data,
     int64_t nbytes, int dtype, int64_t* shape, int rank, MPSGraphError* error);
+MPSGraphTensorHandle mpsgraph_constant_from_buffer(MPSGraphContextHandle ctx, MTLBufferHandle buf,
+    int64_t nbytes, int dtype, int64_t* shape, int rank, MPSGraphError* error);
 MPSGraphTensorHandle mpsgraph_iota(MPSGraphContextHandle ctx, int dtype,
     int64_t* shape, int rank, int axis, MPSGraphError* error);
 

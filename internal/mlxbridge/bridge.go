@@ -369,6 +369,16 @@ func (t *Tape) AddConstant(data unsafe.Pointer, nbytes int64, dtype DType, shape
 	return NodeID(id), nil
 }
 
+// AddConstantArray records an existing ArrayHandle as a constant node in the tape without copying.
+func (t *Tape) AddConstantArray(arr ArrayHandle) (NodeID, error) {
+	var cErr C.MLXError
+	id := C.mlx_tape_add_constant_array(t.handle, C.MLXArrayHandle(unsafe.Pointer(arr)), &cErr)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
 // AddUnary records a unary operation in the tape.
 func (t *Tape) AddUnary(op UnaryOp, input NodeID) (NodeID, error) {
 	var cErr C.MLXError

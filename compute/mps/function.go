@@ -356,14 +356,66 @@ func (f *Function) Constant(flat any, dims ...int) (compute.Value, error) {
 		return nil, errors.Wrap(err, "Constant")
 	}
 
+	return f.finalizeConstantTensor(tensor, isScalar, shape)
+}
+
+func (f *Function) finalizeConstantTensor(tensor bridge.Tensor, isScalar bool, shape shapes.Shape) (compute.Value, error) {
 	if isScalar {
+		var err error
 		tensor, err = f.ctx().Reshape(tensor, nil)
 		if err != nil {
 			return nil, errors.Wrap(err, "Constant: reshape to scalar")
 		}
 	}
-
 	return &graphNode{tensor: tensor, shape: shape, owner: f}, nil
+}
+
+// ConstantFromBuffer creates a constant tensor backed by buf without copying unified memory data when mtlBuf is available.
+func (f *Function) ConstantFromBuffer(buf compute.Buffer, donate bool) (compute.Value, error) {
+	if buf == nil {
+		return nil, errors.New("ConstantFromBuffer: buffer is nil")
+	}
+	gpuBuf, ok := buf.(*gpuBuffer)
+	if !ok {
+		return nil, errors.Errorf("ConstantFromBuffer: buffer (%T) does not belong to backend %q", buf, BackendName)
+	}
+	if gpuBuf.backend != f.builder.backend {
+		return nil, errors.New("ConstantFromBuffer: buffer belongs to a different backend instance")
+	}
+	if !gpuBuf.valid {
+		return nil, errors.New("ConstantFromBuffer: buffer has been finalized")
+	}
+
+	shape := gpuBuf.shape.Clone()
+	if err := checkDTypeSupported(shape.DType); err != nil {
+		return nil, errors.Wrap(err, "ConstantFromBuffer")
+	}
+
+	isScalar := len(shape.Dimensions) == 0
+	shapeDims := toInt64Slice(shape.Dimensions)
+	if isScalar {
+		shapeDims = []int64{1}
+	}
+	bridgeDType := dtypeToBridgeDType(shape.DType)
+	nbytes := int64(shape.ByteSize())
+
+	var tensor bridge.Tensor
+	var err error
+	if gpuBuf.mtlBuf != nil && nbytes > 0 {
+		tensor, err = f.ctx().ConstantFromBuffer(gpuBuf.mtlBuf, nbytes, bridgeDType, shapeDims)
+	} else {
+		dataPtr, fallbackBytes := gpuBuf.flatDataPtr()
+		tensor, err = f.ctx().Constant(dataPtr, fallbackBytes, bridgeDType, shapeDims)
+	}
+	runtime.KeepAlive(gpuBuf)
+	if err != nil {
+		return nil, errors.Wrap(err, "ConstantFromBuffer")
+	}
+
+	if donate {
+		_ = gpuBuf.Finalize()
+	}
+	return f.finalizeConstantTensor(tensor, isScalar, shape)
 }
 
 // Return marks the function outputs.
