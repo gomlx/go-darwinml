@@ -10,6 +10,7 @@ import (
 	"github.com/gomlx/compute"
 	"github.com/gomlx/compute/dtypes"
 	"github.com/gomlx/compute/shapeinference"
+	"github.com/gomlx/compute/shapes"
 	"github.com/gomlx/compute/support/sets"
 	"github.com/gomlx/go-darwinml/internal/mlxbridge"
 	"github.com/pkg/errors"
@@ -38,11 +39,7 @@ func (f *Function) Gather(
 		return nil, errors.Wrap(err, "Gather")
 	}
 
-	if opNode.shape.IsDynamic() || idxNode.shape.IsDynamic() || outShape.IsDynamic() {
-		return nil, errors.Wrapf(compute.ErrNotImplemented,
-			"Gather: dynamic shapes are not supported in %q backend", BackendName)
-	}
-	if outShape.Size() == 0 {
+	if !outShape.IsDynamic() && outShape.Size() == 0 {
 		id, err := f.builder.tape.AddConstant(nil, 0, dtypeToBridgeDType(outShape.DType), outShape.Dimensions)
 		if err != nil {
 			return nil, errors.Wrap(err, "Gather: zero-sized output")
@@ -50,10 +47,14 @@ func (f *Function) Gather(
 		return &graphNode{id: id, shape: outShape, owner: f}, nil
 	}
 
-	// Compute batch dimensions (startIndices dimensions excluding indexVectorAxis).
+	// Compute batch dimensions (startIndices dimensions excluding indexVectorAxis),
+	// encoding any dynamic batch dimensions as references to idxNode.
 	var batchDims []int
 	for ax, d := range idxNode.shape.Dimensions {
 		if ax != indexVectorAxis {
+			if d == shapes.DynamicDim {
+				d = -(2 + int(idxNode.id)*16 + ax)
+			}
 			batchDims = append(batchDims, d)
 		}
 	}

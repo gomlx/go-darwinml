@@ -179,22 +179,23 @@ func (f *Function) ConvGeneral(
 	if err != nil {
 		return nil, errors.Wrap(err, "ConvGeneral")
 	}
+	outShape = f.nameAnonymousDynamicAxes(outShape, "#conv")
 
 	if !inputNode.shape.DType.IsFloat() {
 		return nil, errors.Wrapf(compute.ErrNotImplemented,
 			"ConvGeneral: only floating-point dtypes are supported in %q backend, got %s",
 			BackendName, inputNode.shape.DType)
 	}
-	if inputNode.shape.IsDynamic() || kernelNode.shape.IsDynamic() {
+	if kernelNode.shape.IsDynamic() || inputNode.shape.Dimensions[axes.InputChannels] == shapes.DynamicDim {
 		return nil, errors.Wrapf(compute.ErrNotImplemented,
-			"ConvGeneral: dynamic shapes are not supported in %q backend", BackendName)
+			"ConvGeneral: dynamic kernel or input channel dimensions are not supported in %q backend", BackendName)
 	}
 	if numSpatialDims < 1 || numSpatialDims > 3 {
 		return nil, errors.Wrapf(compute.ErrNotImplemented,
 			"ConvGeneral: only 1D, 2D, and 3D convolutions are supported in %q backend, got %d spatial dims",
 			BackendName, numSpatialDims)
 	}
-	if outShape.Size() == 0 {
+	if !outShape.IsDynamic() && outShape.Size() == 0 {
 		id, err := f.builder.tape.AddConstant(nil, 0, dtypeToBridgeDType(outShape.DType), outShape.Dimensions)
 		if err != nil {
 			return nil, errors.Wrap(err, "ConvGeneral: zero-sized output")
@@ -216,12 +217,16 @@ func (f *Function) ConvGeneral(
 			}
 		}
 	}
+	if inputNode.shape.IsDynamic() && (batchGroupCount > 1 || hasNegativePad) {
+		return nil, errors.Wrapf(compute.ErrNotImplemented,
+			"ConvGeneral: dynamic shapes with batchGroupCount > 1 or negative padding are not supported in %q backend", BackendName)
+	}
 
 	// Fast path for weight-gradient convolutions (convVJPWrtKernel) where the output spatial
 	// filter size is small (e.g. 1x1, 3x3) and the contracted kernel spatial size is large:
 	// use patch extraction + Split-K Matmul (matching MLX's internal conv_weight_backward_patches),
 	// which also avoids transposing NHWC inputs/cotangents/outputs.
-	if channelGroupCount == 1 && batchGroupCount == 1 && !hasNegativePad {
+	if !inputNode.shape.IsDynamic() && channelGroupCount == 1 && batchGroupCount == 1 && !hasNegativePad {
 		allInDilOne := true
 		for _, d := range inDil {
 			if d != 1 {
@@ -369,7 +374,9 @@ func (f *Function) ConvGeneral(
 		}
 	}
 
-	return &graphNode{id: convID, shape: outShape, owner: f}, nil
+	outNode := &graphNode{id: convID, shape: outShape, owner: f}
+	f.registerDynamicAxes(outNode)
+	return outNode, nil
 }
 
 // convWeightBackwardPatches computes a convolution where the contracted spatial dimensions
@@ -572,10 +579,6 @@ func (f *Function) ReduceWindow(
 	if err != nil {
 		return nil, errors.Wrap(err, "ReduceWindow")
 	}
-	if opNode.shape.IsDynamic() {
-		return nil, errors.Wrapf(compute.ErrNotImplemented,
-			"ReduceWindow: dynamic shapes are not supported in %q backend", BackendName)
-	}
 	if opNode.shape.DType == dtypes.Complex64 && (reductionType == compute.ReduceOpMax || reductionType == compute.ReduceOpMin) {
 		return nil, errors.Wrapf(compute.ErrNotImplemented,
 			"ReduceWindow: Max/Min not supported for Complex64 in %q backend", BackendName)
@@ -591,7 +594,7 @@ func (f *Function) ReduceWindow(
 	if rank == 0 {
 		return f.Identity(opNode)
 	}
-	if outShape.Size() == 0 {
+	if !outShape.IsDynamic() && outShape.Size() == 0 {
 		id, err := f.builder.tape.AddConstant(nil, 0, dtypeToBridgeDType(outShape.DType), outShape.Dimensions)
 		if err != nil {
 			return nil, errors.Wrap(err, "ReduceWindow: zero-sized output")
@@ -679,6 +682,10 @@ func (f *Function) ReduceWindow(
 			nonOverlapping = false
 			break
 		}
+		if pDims[i] == shapes.DynamicDim {
+			coveredDims[i] = -1
+			continue
+		}
 		coveredDims[i] = outShape.Dimensions[i] * winDims[i]
 		if coveredDims[i] > pDims[i] {
 			nonOverlapping = false
@@ -705,7 +712,11 @@ func (f *Function) ReduceWindow(
 		splitShape := make([]int, 0, 2*rank)
 		reduceAxes := make([]int, 0, rank)
 		for i := range rank {
-			splitShape = append(splitShape, outShape.Dimensions[i])
+			outDim := outShape.Dimensions[i]
+			if outDim == shapes.DynamicDim {
+				outDim = -(2 + int(paddedNode.id)*16 + i)
+			}
+			splitShape = append(splitShape, outDim)
 			if winDims[i] > 1 {
 				reduceAxes = append(reduceAxes, len(splitShape))
 				splitShape = append(splitShape, winDims[i])
@@ -728,6 +739,13 @@ func (f *Function) ReduceWindow(
 	// Step 2: General overlapping or dilated windows — construct an interleaved strided view
 	// where window axes W_i (only for winDims[i] > 1) are placed immediately after O_i,
 	// preserving stride-1 inner channel axes at the end for coalesced GPU reductions.
+	for i := 1; i < rank; i++ {
+		if pDims[i] == shapes.DynamicDim {
+			return nil, errors.Wrapf(compute.ErrNotImplemented,
+				"ReduceWindow: overlapping windows with dynamic non-leading axis %d are not supported in %q backend",
+				i, BackendName)
+		}
+	}
 	rowStrides := make([]int64, rank)
 	rowStrides[rank-1] = 1
 	for i := rank - 2; i >= 0; i-- {
@@ -738,7 +756,11 @@ func (f *Function) ReduceWindow(
 	viewStrides := make([]int64, 0, 2*rank)
 	reduceAxes := make([]int, 0, rank)
 	for i := range rank {
-		viewShape = append(viewShape, outShape.Dimensions[i])
+		outDim := outShape.Dimensions[i]
+		if outDim == shapes.DynamicDim {
+			outDim = -(2 + int(paddedNode.id)*16 + i)
+		}
+		viewShape = append(viewShape, outDim)
 		viewStrides = append(viewStrides, rowStrides[i]*int64(winStrides[i]))
 		if winDims[i] > 1 {
 			reduceAxes = append(reduceAxes, len(viewShape))

@@ -924,7 +924,7 @@ struct MLXTape {
             for (int32_t child : n.inputs) {
                 if (child >= 0) reachable[child] = 1;
             }
-            if (n.kind == TapeOpKind::BroadcastInDim || n.kind == TapeOpKind::Reshape) {
+            if (n.kind == TapeOpKind::BroadcastInDim || n.kind == TapeOpKind::Reshape || n.kind == TapeOpKind::AsStrided) {
                 for (int32_t d : n.shape) {
                     if (d <= -2) {
                         int32_t ref_node = (-d - 2) / 16;
@@ -1143,12 +1143,42 @@ struct MLXTape {
                 case TapeOpKind::Gather: {
                     const mlx::core::array& a = values.at(node.lhs);
                     const mlx::core::array& idx = values.at(node.rhs);
+                    mlx::core::Shape out_shape;
+                    for (int ax = 0; ax < static_cast<int>(idx.ndim()); ++ax) {
+                        if (ax != node.index) {
+                            out_shape.push_back(idx.shape(ax));
+                        }
+                    }
+                    for (int32_t s : node.shape) {
+                        out_shape.push_back(s);
+                    }
+                    bool is_empty = (a.size() == 0);
+                    for (int32_t d : out_shape) {
+                        if (d == 0) {
+                            is_empty = true;
+                            break;
+                        }
+                    }
+                    if (is_empty) {
+                        values[idx_node] = mlx::core::zeros(out_shape, a.dtype());
+                        break;
+                    }
                     std::vector<mlx::core::array> indices_vec;
                     if (!node.axes.empty()) {
                         if (node.index == static_cast<int>(idx.ndim())) {
                             indices_vec.push_back(idx);
                         } else {
                             indices_vec = mlx::core::unstack(idx, node.index);
+                        }
+                        for (size_t k = 0; k < indices_vec.size() && k < node.axes.size(); ++k) {
+                            int op_axis = node.axes[k];
+                            int32_t max_start = std::max<int32_t>(0, a.shape(op_axis) - node.shape[op_axis]);
+                            mlx::core::Dtype dt = indices_vec[k].dtype();
+                            mlx::core::array zero_arr = mlx::core::array(0, dt);
+                            mlx::core::array max_arr = (dt == mlx::core::int32)
+                                ? mlx::core::array(max_start, mlx::core::int32)
+                                : mlx::core::astype(mlx::core::array(max_start, mlx::core::int32), dt);
+                            indices_vec[k] = mlx::core::clip(indices_vec[k], zero_arr, max_arr);
                         }
                     }
                     values[idx_node] = mlx::core::gather(a, indices_vec, node.axes, node.shape);
@@ -1257,8 +1287,17 @@ struct MLXTape {
                     if (!a.flags().row_contiguous) {
                         a = mlx::core::contiguous(a);
                     }
+                    mlx::core::Shape target_shape = node.shape;
+                    for (size_t i = 0; i < target_shape.size(); ++i) {
+                        if (target_shape[i] <= -2) {
+                            int32_t enc = -target_shape[i] - 2;
+                            int32_t ref_node = enc / 16;
+                            int ref_axis = enc % 16;
+                            target_shape[i] = values.at(ref_node).shape(ref_axis);
+                        }
+                    }
                     mlx::core::array s = mlx::core::as_strided(
-                        a, node.shape, node.strides, static_cast<size_t>(node.offset));
+                        a, target_shape, node.strides, static_cast<size_t>(node.offset));
                     if (!node.strides.empty() && node.strides.back() != 1) {
                         s = mlx::core::contiguous(s);
                     }

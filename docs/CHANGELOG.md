@@ -1,3 +1,9 @@
+- Next:
+  - Added Apple MLX (`"mlx"` and `"mlx:dynamic"`) backend (`compute/mlx` and `internal/mlxbridge`), documented in [`docs/MLX.md`](MLX.md).
+  - Updated `"mlx"` and `"mps"` backends for the expanded `DynamicOps` and `DataDependentOps` compliance suites:
+    - `compute/mlx`: Added XLA start-index clamping (`[0, max(0, dim - sliceSize)]`) and empty-output handling to `Gather`, enabled dynamic-shape execution for `Gather`, `ConvGeneral`, and `ReduceWindow` (including dynamic dimension resolution in `AsStrided`), and minted unique internal names (`#conv_*`, `#dot_*`) for derived anonymous dynamic axes in `ConvGeneral` and `DotGeneral`.
+    - `compute/mps`: Added XLA start-index clamping (`[0, max(0, dim - sliceSize)]`), multi-element window expansion on indexed axes (`sliceSizes[axis] > 1` in `startIndexMap`), and zero-sized output handling to `Gather`.
+
 - 2026-11-05:
   - Migrated `go-darwinml` to the `github.com/gomlx/compute` backend interface:
     - Consolidated into a single Go module (`github.com/gomlx/go-darwinml`) without depending on `github.com/gomlx/gomlx`.

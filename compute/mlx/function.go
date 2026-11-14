@@ -35,16 +35,23 @@ type graphNode struct {
 	lhs, rhs *graphNode
 }
 
+type dynamicAxisSource struct {
+	nodeID mlxbridge.NodeID
+	axis   int
+}
+
 // Function implements compute.Function for the MLX backend.
 type Function struct {
 	notimplemented.Function
 
-	builder  *Builder
-	name     string
-	parent   *Function
-	returned bool
-	params   []*graphNode
-	outputs  []*graphNode
+	builder            *Builder
+	name               string
+	parent             *Function
+	returned           bool
+	params             []*graphNode
+	outputs            []*graphNode
+	knownDynamicAxes   sets.Set[string]
+	dynamicAxisSources map[string]dynamicAxisSource
 }
 
 // Verify interface compliance.
@@ -93,7 +100,8 @@ func (f *Function) Parameter(name string, shape shapes.Shape, _ *compute.Shardin
 	}
 	if shape.IsDynamic() && !f.builder.backend.dynamicShapes {
 		return nil, errors.Wrapf(compute.ErrNotImplemented,
-			"Parameter(%q): dynamic shape %s requires %q backend configuration", name, shape, "mlx:dynamic")
+			"Parameter(%q): dynamic shape %s is not supported in %q backend (use %q to enable dynamic shapes)",
+			name, shape, BackendName, "mlx:dynamic")
 	}
 	var id mlxbridge.NodeID
 	var err error
@@ -112,6 +120,7 @@ func (f *Function) Parameter(name string, shape shapes.Shape, _ *compute.Shardin
 		owner: f,
 	}
 	f.params = append(f.params, node)
+	f.registerDynamicAxes(node)
 	return node, nil
 }
 
@@ -970,31 +979,101 @@ func (f *Function) GreaterOrEqualTotalOrder(lhs, rhs compute.Value) (compute.Val
 // Shape Manipulation Operations
 // ===========================================================================
 
-// knownDynamicAxisNames returns all named dynamic axes from this function's parameters and its ancestors.
+// rootFunction returns the root Function of this function's scope hierarchy.
+func (f *Function) rootFunction() *Function {
+	root := f
+	for root.parent != nil {
+		root = root.parent
+	}
+	return root
+}
+
+// registerDynamicAxes records named dynamic axes introduced by n on the root function.
+func (f *Function) registerDynamicAxes(n *graphNode) {
+	if n == nil || !n.shape.IsDynamic() {
+		return
+	}
+	root := f.rootFunction()
+	if root.knownDynamicAxes == nil {
+		root.knownDynamicAxes = sets.Make[string]()
+	}
+	if root.dynamicAxisSources == nil {
+		root.dynamicAxisSources = make(map[string]dynamicAxisSource)
+	}
+	for axis, dim := range n.shape.Dimensions {
+		if dim != shapes.DynamicDim {
+			continue
+		}
+		name := n.shape.AxisName(axis)
+		if name == "" || name == shapes.AnonymousAxis {
+			continue
+		}
+		root.knownDynamicAxes.Insert(name)
+		if _, exists := root.dynamicAxisSources[name]; !exists {
+			root.dynamicAxisSources[name] = dynamicAxisSource{nodeID: n.id, axis: axis}
+		}
+	}
+}
+
+// nameAnonymousDynamicAxes assigns fresh names to anonymous dynamic axes in shape.
+func (f *Function) nameAnonymousDynamicAxes(shape shapes.Shape, base string) shapes.Shape {
+	var names []string
+	for axis, dim := range shape.Dimensions {
+		if dim != shapes.DynamicDim || shape.AxisName(axis) != shapes.AnonymousAxis {
+			continue
+		}
+		if names == nil {
+			names = slices.Clone(shape.AxisNames)
+			if names == nil {
+				names = make([]string, shape.Rank())
+			}
+		}
+		known := f.knownDynamicAxisNames()
+		for {
+			candidate := f.builder.backend.UniqueAxisName(base)
+			if !known.Has(candidate) {
+				names[axis] = candidate
+				known.Insert(candidate)
+				break
+			}
+		}
+	}
+	if names == nil {
+		return shape
+	}
+	shape.AxisNames = names
+	return shape
+}
+
+// knownDynamicAxisNames returns all named dynamic axes from this function's parameters and derived ops.
 func (f *Function) knownDynamicAxisNames() sets.Set[string] {
-	var names sets.Set[string]
+	root := f.rootFunction()
+	if root.knownDynamicAxes == nil {
+		root.knownDynamicAxes = sets.Make[string]()
+	}
 	for cur := f; cur != nil; cur = cur.parent {
 		for _, p := range cur.params {
 			for axis, d := range p.shape.Dimensions {
 				if d == shapes.DynamicDim {
 					name := p.shape.AxisName(axis)
 					if name != "" && name != shapes.AnonymousAxis {
-						if names == nil {
-							names = sets.Make[string]()
-						}
-						names.Insert(name)
+						root.knownDynamicAxes.Insert(name)
 					}
 				}
 			}
 		}
 	}
-	return names
+	return root.knownDynamicAxes
 }
 
-// findDynamicAxisSource returns the parameter node ID and axis index that defines the given dynamic axis name.
+// findDynamicAxisSource returns the node ID and axis index that defines the given dynamic axis name.
 func (f *Function) findDynamicAxisSource(axisName string) (mlxbridge.NodeID, int, bool) {
 	if axisName == "" || axisName == shapes.AnonymousAxis {
 		return -1, -1, false
+	}
+	root := f.rootFunction()
+	if src, ok := root.dynamicAxisSources[axisName]; ok {
+		return src.nodeID, src.axis, true
 	}
 	for cur := f; cur != nil; cur = cur.parent {
 		for _, p := range cur.params {
@@ -1017,6 +1096,11 @@ func (f *Function) Reshape(x compute.Value, dimensions ...int) (compute.Value, e
 	outShape, err := shapeinference.Reshape(node.shape, dimensions)
 	if err != nil {
 		return nil, errors.Wrap(err, "Reshape")
+	}
+	if outShape.IsDynamic() && !f.builder.backend.dynamicShapes {
+		return nil, errors.Wrapf(compute.ErrNotImplemented,
+			"Reshape: dynamic shape %s is not supported in %q backend (use %q to enable dynamic shapes)",
+			outShape, BackendName, "mlx:dynamic")
 	}
 	id, err := f.builder.tape.AddReshape(node.id, outShape.Dimensions)
 	if err != nil {
@@ -1046,6 +1130,11 @@ func (f *Function) Transpose(x compute.Value, permutation ...int) (compute.Value
 func (f *Function) BroadcastInDim(operand compute.Value, outputShape shapes.Shape, broadcastAxes []int) (compute.Value, error) {
 	if err := f.builder.backend.checkDTypeSupported(outputShape.DType); err != nil {
 		return nil, errors.Wrap(err, "BroadcastInDim")
+	}
+	if outputShape.IsDynamic() && !f.builder.backend.dynamicShapes {
+		return nil, errors.Wrapf(compute.ErrNotImplemented,
+			"BroadcastInDim: dynamic shape %s is not supported in %q backend (use %q to enable dynamic shapes)",
+			outputShape, BackendName, "mlx:dynamic")
 	}
 	node, err := f.resolveNode(operand)
 	if err != nil {
