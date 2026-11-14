@@ -4101,3 +4101,37 @@ func (f *Function) FusedAttentionQKVProjection(
 
 	return query, key, value, nil
 }
+
+// FusedTopK returns sorted values and Int32 indices of the k largest (or smallest when cfg.Smallest is true)
+// elements along cfg.Axis. Ties prefer the lower original index.
+func (f *Function) FusedTopK(operand compute.Value, k int, cfg compute.FusedTopKConfig) (values, indices compute.Value, err error) {
+	opNode, err := f.resolveNode(operand)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "FusedTopK")
+	}
+	valuesShape, indicesShape, err := shapeinference.FusedTopK(opNode.shape, k, cfg)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "FusedTopK")
+	}
+	if err := checkDTypeSupported(opNode.shape.DType); err != nil {
+		return nil, nil, errors.Wrap(err, "FusedTopK")
+	}
+	if valuesShape.Size() == 0 {
+		return &graphNode{tensor: nil, shape: valuesShape, owner: f},
+			&graphNode{tensor: nil, shape: indicesShape, owner: f},
+			nil
+	}
+
+	axis := cfg.Axis
+	if axis < 0 {
+		axis += opNode.shape.Rank()
+	}
+
+	valTensor, idxTensor, err := f.ctx().TopK(opNode.tensor, axis, k, cfg.Smallest)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "FusedTopK")
+	}
+	return &graphNode{tensor: valTensor, shape: valuesShape, owner: f},
+		&graphNode{tensor: idxTensor, shape: indicesShape, owner: f},
+		nil
+}

@@ -980,3 +980,72 @@ func (f *Function) repeatHeads(node *graphNode, headsAxis, repeats int) (compute
 	finalDims[headsAxis] = numKVHeads * repeats
 	return f.Reshape(broadcasted, finalDims...)
 }
+
+// FusedTopK returns sorted values and Int32 indices of the k largest (or smallest when cfg.Smallest is true)
+// elements along cfg.Axis. Ties prefer the lower original index.
+func (f *Function) FusedTopK(operand compute.Value, k int, cfg compute.FusedTopKConfig) (values, indices compute.Value, err error) {
+	opNode, err := f.resolveNode(operand)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "FusedTopK")
+	}
+	valuesShape, indicesShape, err := shapeinference.FusedTopK(opNode.shape, k, cfg)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "FusedTopK")
+	}
+	if err := f.builder.backend.checkDTypeSupported(opNode.shape.DType); err != nil {
+		return nil, nil, errors.Wrap(err, "FusedTopK")
+	}
+
+	rank := opNode.shape.Rank()
+	axis := cfg.Axis
+	if axis < 0 {
+		axis += rank
+	}
+
+	keyID := opNode.id
+	if !cfg.Smallest {
+		// To sort in descending order while preserving lower original index on ties with MLX's
+		// stable argsort, invert key ordering before argsort:
+		// - Floating-point types: negate (-x).
+		// - Signed/unsigned two's-complement integer types: bitwise NOT (~x = -1 - x).
+		if opNode.shape.DType.IsFloat() {
+			keyID, err = f.builder.tape.AddUnary(mlxbridge.UnaryNeg, opNode.id)
+		} else {
+			keyID, err = f.builder.tape.AddUnary(mlxbridge.UnaryBitwiseNot, opNode.id)
+		}
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "FusedTopK: key transform")
+		}
+	}
+
+	sortedIdxID, err := f.builder.tape.AddArgsort(keyID, axis)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "FusedTopK: argsort")
+	}
+
+	starts := make([]int, rank)
+	limits := slices.Clone(opNode.shape.Dimensions)
+	limits[axis] = k
+	strides := make([]int, rank)
+	for i := range rank {
+		strides[i] = 1
+	}
+	slicedIdxID, err := f.builder.tape.AddSlice(sortedIdxID, starts, limits, strides)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "FusedTopK: slice indices")
+	}
+
+	indicesID, err := f.builder.tape.AddConvertDType(slicedIdxID, dtypeToBridgeDType(dtypes.Int32))
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "FusedTopK: cast indices to Int32")
+	}
+
+	valuesID, err := f.builder.tape.AddTakeAlongAxis(opNode.id, indicesID, axis)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "FusedTopK: take_along_axis")
+	}
+
+	return &graphNode{id: valuesID, shape: valuesShape, owner: f},
+		&graphNode{id: indicesID, shape: indicesShape, owner: f},
+		nil
+}

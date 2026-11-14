@@ -1820,3 +1820,57 @@ MPSGraphTensorHandle mpsgraph_scatter_along_axis(MPSGraphContextHandle handle,
         return (__bridge void*)result;
     }
 }
+
+// ===========================================================================
+// TopK / BottomK
+// ===========================================================================
+
+bool mpsgraph_top_k(MPSGraphContextHandle handle,
+    MPSGraphTensorHandle sourceH, int axis, int k, bool smallest,
+    MPSGraphTensorHandle* outValues, MPSGraphTensorHandle* outIndices,
+    MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* source = (__bridge MPSGraphTensor*)sourceH;
+
+        MPSGraphTensor* key = source;
+        if (!smallest) {
+            // MPSGraph's topKWithSourceTensor breaks ties toward the higher original index,
+            // whereas bottomKWithSourceTensor breaks ties toward the lower original index.
+            // Invert key ordering (negate floats, bitwise-NOT two's-complement integers) and use bottomK.
+            MPSDataType dt = source.dataType;
+            if (dt == MPSDataTypeFloat16 || dt == MPSDataTypeBFloat16 || dt == MPSDataTypeFloat32) {
+                key = [ctx.graph negativeWithTensor:source name:nil];
+            } else {
+                key = [ctx.graph bitwiseNOTWithTensor:source name:nil];
+            }
+        }
+
+        NSArray<MPSGraphTensor*>* res = [ctx.graph bottomKWithSourceTensor:key
+                                                                      axis:(NSInteger)axis
+                                                                         k:(NSUInteger)k
+                                                                      name:nil];
+        if (!res || res.count < 2) {
+            setError(error, 250, @"topK/bottomK failed");
+            return false;
+        }
+        MPSGraphTensor* indices = res[1];
+        MPSGraphTensor* values = nil;
+        if (smallest && source.dataType != MPSDataTypeInt64 && source.dataType != MPSDataTypeUInt64) {
+            values = res[0];
+        } else {
+            values = [ctx.graph gatherAlongAxis:(NSInteger)axis
+                              withUpdatesTensor:source
+                                  indicesTensor:indices
+                                           name:nil];
+        }
+        if (!values || !indices) {
+            setError(error, 251, @"topK/bottomK gather failed");
+            return false;
+        }
+        *outValues = (__bridge void*)values;
+        *outIndices = (__bridge void*)indices;
+        return true;
+    }
+}

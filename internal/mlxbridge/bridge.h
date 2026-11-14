@@ -318,6 +318,9 @@ int32_t mlx_tape_add_softmax(MLXTapeHandle tape, int32_t input, int axis, MLXErr
 int32_t mlx_tape_add_layer_norm(MLXTapeHandle tape, int32_t input, int32_t gamma, int32_t beta,
     float eps, MLXError* error);
 
+// Records a NonZero operation returning int64 coordinates [count, rank] (or [rank, count] if transpose is true).
+int32_t mlx_tape_add_nonzero(MLXTapeHandle tape, int32_t operand, bool transpose, MLXError* error);
+
 // Compiles a tape into an executable.
 // If compile_graph is true, traces and compiles the tape with mlx::core::compile.
 // If eager_contiguous is true, appends mlx::core::contiguous() to every output before eval().

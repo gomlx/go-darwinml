@@ -1622,3 +1622,49 @@ func (f *Function) CumMax(operand compute.Value, axis int, options compute.CumSu
 	}
 	return &graphNode{id: id, shape: outShape, owner: f}, nil
 }
+
+// ===========================================================================
+// Data-Dependent Dynamic Operations (NonZero)
+// ===========================================================================
+
+// NonZero returns row-major coordinates of nonzero elements as an int64 tensor [count, rank]
+// (or [rank, count] if cfg.Transpose is true).
+func (f *Function) NonZero(operand compute.Value, cfg compute.NonZeroConfig) (compute.Value, error) {
+	if !f.builder.backend.dynamicShapes {
+		return nil, errors.Wrapf(compute.ErrNotImplemented,
+			"NonZero: dynamic shapes are not supported in %q backend (use %q to enable dynamic shapes)",
+			BackendName, "mlx:dynamic")
+	}
+	opNode, err := f.resolveNode(operand)
+	if err != nil {
+		return nil, errors.Wrap(err, "NonZero")
+	}
+	if err := f.builder.backend.checkDTypeSupported(opNode.shape.DType); err != nil {
+		return nil, errors.Wrap(err, "NonZero")
+	}
+
+	knownAxisNames := f.knownDynamicAxisNames()
+	if cfg.CountAxisName == "" {
+		for {
+			cfg.CountAxisName = f.builder.backend.UniqueAxisName("#nonzeros")
+			if !knownAxisNames.Has(cfg.CountAxisName) {
+				break
+			}
+		}
+	} else if knownAxisNames.Has(cfg.CountAxisName) {
+		return nil, errors.Errorf("NonZero: count axis name %q is already in use", cfg.CountAxisName)
+	}
+
+	outShape, err := shapeinference.NonZero(opNode.shape, cfg)
+	if err != nil {
+		return nil, errors.Wrap(err, "NonZero")
+	}
+
+	id, err := f.builder.tape.AddNonZero(opNode.id, cfg.Transpose)
+	if err != nil {
+		return nil, errors.Wrap(err, "NonZero")
+	}
+	outNode := &graphNode{id: id, shape: outShape, owner: f}
+	f.registerDynamicAxes(outNode)
+	return outNode, nil
+}

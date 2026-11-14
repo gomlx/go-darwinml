@@ -773,6 +773,22 @@ func (c *Context) ScatterAlongAxis(data, indices, updates Tensor, axis, mode int
 	return Tensor(t), nil
 }
 
+// TopK selects the k largest (or smallest when smallest is true) elements along axis,
+// returning both values and Int32 indices tensors.
+func (c *Context) TopK(source Tensor, axis, k int, smallest bool) (values, indices Tensor, err error) {
+	var cErr C.MPSGraphError
+	var cVals, cIdxs C.MPSGraphTensorHandle
+	ok := C.mpsgraph_top_k(c.handle, C.MPSGraphTensorHandle(source),
+		C.int(axis), C.int(k), C.bool(smallest), &cVals, &cIdxs, &cErr)
+	if !ok {
+		if err := extractError(cErr); err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, fmt.Errorf("mpsgraph: TopK failed")
+	}
+	return Tensor(cVals), Tensor(cIdxs), nil
+}
+
 // ===========================================================================
 // Dynamic Slice
 // ===========================================================================

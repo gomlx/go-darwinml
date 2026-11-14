@@ -816,6 +816,16 @@ func (t *Tape) AddLayerNorm(input, gamma, beta NodeID, eps float32) (NodeID, err
 	return NodeID(id), nil
 }
 
+// AddNonZero records a NonZero operation in the tape.
+func (t *Tape) AddNonZero(operand NodeID, transpose bool) (NodeID, error) {
+	var cErr C.MLXError
+	id := C.mlx_tape_add_nonzero(t.handle, C.int32_t(operand), C.bool(transpose), &cErr)
+	if err := extractError(cErr); err != nil {
+		return -1, err
+	}
+	return NodeID(id), nil
+}
+
 // Compile compiles the tape into an Exec.
 func (t *Tape) Compile(outputIDs []NodeID, compileGraph, eagerContiguous bool) (*Exec, error) {
 	var cErr C.MLXError

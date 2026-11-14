@@ -111,6 +111,7 @@ func New(config string) (compute.Backend, error) {
 	if dynamicShapes {
 		caps.DynamicAxes = true
 		caps.DynamicShapes = compute.DynamicShapesNative
+		caps.Operations[compute.OpTypeNonZero] = true
 	}
 
 	return &Backend{
