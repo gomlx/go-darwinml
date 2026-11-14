@@ -1,4 +1,5 @@
 - Next:
+  - Replaced `shapes.AnonymousAxis` (`"?"`), `Backend.UniqueAxisName`, and `Function.nameAnonymousDynamicAxes` in `compute/mlx` with `shapes.UniqueAxisName` and `shapes.AxisNamesCompatible` (`compute/mlx/{backend,executable,function,conv_pool_norm,dotgeneral}.go`).
   - Added Apple MLX (`"mlx"` and `"mlx:dynamic"`) backend (`compute/mlx` and `internal/mlxbridge`), documented in [`docs/MLX.md`](MLX.md).
   - Updated `"mlx"` and `"mps"` backends for the expanded `DynamicOps` and `DataDependentOps` compliance suites:
     - `compute/mlx`: Added `FusedTopK` (across all sortable dtypes and dynamic shapes with lower-index tie-breaking), `NonZero` (in `"mlx:dynamic"` mode with `#nonzeros_*` dynamic count-axis propagation), XLA start-index clamping (`[0, max(0, dim - sliceSize)]`) and empty-output handling to `Gather`, dynamic-shape execution for `Gather`, `ConvGeneral`, and `ReduceWindow` (including dynamic dimension resolution in `AsStrided`), and unique internal names (`#conv_*`, `#dot_*`) for derived anonymous dynamic axes in `ConvGeneral` and `DotGeneral`.

@@ -1005,7 +1005,7 @@ func (f *Function) registerDynamicAxes(n *graphNode) {
 			continue
 		}
 		name := n.shape.AxisName(axis)
-		if name == "" || name == shapes.AnonymousAxis {
+		if name == "" {
 			continue
 		}
 		root.knownDynamicAxes.Insert(name)
@@ -1013,36 +1013,6 @@ func (f *Function) registerDynamicAxes(n *graphNode) {
 			root.dynamicAxisSources[name] = dynamicAxisSource{nodeID: n.id, axis: axis}
 		}
 	}
-}
-
-// nameAnonymousDynamicAxes assigns fresh names to anonymous dynamic axes in shape.
-func (f *Function) nameAnonymousDynamicAxes(shape shapes.Shape, base string) shapes.Shape {
-	var names []string
-	for axis, dim := range shape.Dimensions {
-		if dim != shapes.DynamicDim || shape.AxisName(axis) != shapes.AnonymousAxis {
-			continue
-		}
-		if names == nil {
-			names = slices.Clone(shape.AxisNames)
-			if names == nil {
-				names = make([]string, shape.Rank())
-			}
-		}
-		known := f.knownDynamicAxisNames()
-		for {
-			candidate := f.builder.backend.UniqueAxisName(base)
-			if !known.Has(candidate) {
-				names[axis] = candidate
-				known.Insert(candidate)
-				break
-			}
-		}
-	}
-	if names == nil {
-		return shape
-	}
-	shape.AxisNames = names
-	return shape
 }
 
 // knownDynamicAxisNames returns all named dynamic axes from this function's parameters and derived ops.
@@ -1056,7 +1026,7 @@ func (f *Function) knownDynamicAxisNames() sets.Set[string] {
 			for axis, d := range p.shape.Dimensions {
 				if d == shapes.DynamicDim {
 					name := p.shape.AxisName(axis)
-					if name != "" && name != shapes.AnonymousAxis {
+					if name != "" {
 						root.knownDynamicAxes.Insert(name)
 					}
 				}
@@ -1068,7 +1038,7 @@ func (f *Function) knownDynamicAxisNames() sets.Set[string] {
 
 // findDynamicAxisSource returns the node ID and axis index that defines the given dynamic axis name.
 func (f *Function) findDynamicAxisSource(axisName string) (mlxbridge.NodeID, int, bool) {
-	if axisName == "" || axisName == shapes.AnonymousAxis {
+	if axisName == "" {
 		return -1, -1, false
 	}
 	root := f.rootFunction()
@@ -1646,7 +1616,7 @@ func (f *Function) NonZero(operand compute.Value, cfg compute.NonZeroConfig) (co
 	knownAxisNames := f.knownDynamicAxisNames()
 	if cfg.CountAxisName == "" {
 		for {
-			cfg.CountAxisName = f.builder.backend.UniqueAxisName("#nonzeros")
+			cfg.CountAxisName = shapes.UniqueAxisName("#nonzeros")
 			if !knownAxisNames.Has(cfg.CountAxisName) {
 				break
 			}

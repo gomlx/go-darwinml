@@ -179,7 +179,6 @@ func (f *Function) ConvGeneral(
 	if err != nil {
 		return nil, errors.Wrap(err, "ConvGeneral")
 	}
-	outShape = f.nameAnonymousDynamicAxes(outShape, "#conv")
 
 	if !inputNode.shape.DType.IsFloat() {
 		return nil, errors.Wrapf(compute.ErrNotImplemented,
