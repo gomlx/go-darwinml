@@ -6,6 +6,7 @@ package mlx
 
 import (
 	"math"
+	"slices"
 
 	"github.com/gomlx/compute"
 	"github.com/gomlx/compute/dtypes"
@@ -1219,9 +1220,10 @@ func (f *Function) RNGBitGenerator(state compute.Value, shape shapes.Shape) (new
 	if err := f.builder.backend.checkDTypeSupported(shape.DType); err != nil {
 		return nil, nil, errors.Wrap(err, "RNGBitGenerator")
 	}
-	if shape.IsDynamic() {
+	if shape.IsDynamic() && !f.builder.backend.dynamicShapes {
 		return nil, nil, errors.Wrapf(compute.ErrNotImplemented,
-			"RNGBitGenerator: dynamic shape %s is not supported in %q backend", shape, BackendName)
+			"RNGBitGenerator: dynamic shape %s is not supported in %q backend (use %q to enable dynamic shapes)",
+			shape, BackendName, "mlx:dynamic")
 	}
 	stateNode, err := f.resolveNode(state)
 	if err != nil {
@@ -1232,8 +1234,25 @@ func (f *Function) RNGBitGenerator(state compute.Value, shape shapes.Shape) (new
 			compute.RNGStateShape, stateNode.shape)
 	}
 
+	targetDims := slices.Clone(shape.Dimensions)
+	if shape.IsDynamic() {
+		for outAx, d := range targetDims {
+			if d == shapes.DynamicDim {
+				name := shape.AxisName(outAx)
+				if name == "" {
+					return nil, nil, errors.Errorf("RNGBitGenerator: dynamic axis %d of shape %s must have an axis name", outAx, shape)
+				}
+				srcID, srcAx, ok := f.findDynamicAxisSource(name)
+				if !ok {
+					return nil, nil, errors.Errorf("RNGBitGenerator: unknown dynamic axis %q at axis %d of shape %s", name, outAx, shape)
+				}
+				targetDims[outAx] = -(2 + int(srcID)*16 + srcAx)
+			}
+		}
+	}
+
 	newStateID, valuesID, err := f.builder.tape.AddRNGBitGenerator(
-		stateNode.id, dtypeToBridgeDType(shape.DType), shape.Dimensions)
+		stateNode.id, dtypeToBridgeDType(shape.DType), targetDims)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "RNGBitGenerator")
 	}

@@ -851,6 +851,11 @@ mlx::core::array evalSelectAndScatter(
 }
 
 mlx::core::array evalRNGBits(const mlx::core::array& state, const mlx::core::Shape& shape, mlx::core::Dtype dt) {
+    for (int32_t d : shape) {
+        if (d == 0) {
+            return mlx::core::zeros(shape, dt);
+        }
+    }
     mlx::core::array s_contig = state.flags().row_contiguous ? state : mlx::core::contiguous(state);
     mlx::core::array s32 = mlx::core::reshape(mlx::core::view(s_contig, mlx::core::uint32), {6});
     mlx::core::array k0 = mlx::core::slice(s32, {0}, {2});
@@ -977,7 +982,8 @@ struct MLXTape {
             for (int32_t child : n.inputs) {
                 if (child >= 0) reachable[child] = 1;
             }
-            if (n.kind == TapeOpKind::BroadcastInDim || n.kind == TapeOpKind::Reshape || n.kind == TapeOpKind::AsStrided) {
+            if (n.kind == TapeOpKind::BroadcastInDim || n.kind == TapeOpKind::Reshape ||
+                n.kind == TapeOpKind::AsStrided || n.kind == TapeOpKind::RNGBits) {
                 for (int32_t d : n.shape) {
                     if (d <= -2) {
                         int32_t ref_node = (-d - 2) / 16;
@@ -1372,9 +1378,19 @@ struct MLXTape {
                         values.at(node.lhs),
                         mlx::core::array(uint64_t(1)));
                     break;
-                case TapeOpKind::RNGBits:
-                    values[idx_node] = evalRNGBits(values.at(node.lhs), node.shape, node.dtype);
+                case TapeOpKind::RNGBits: {
+                    mlx::core::Shape target_shape = node.shape;
+                    for (size_t i = 0; i < target_shape.size(); ++i) {
+                        if (target_shape[i] <= -2) {
+                            int32_t enc = -target_shape[i] - 2;
+                            int32_t ref_node = enc / 16;
+                            int ref_axis = enc % 16;
+                            target_shape[i] = values.at(ref_node).shape(ref_axis);
+                        }
+                    }
+                    values[idx_node] = evalRNGBits(values.at(node.lhs), target_shape, node.dtype);
                     break;
+                }
                 case TapeOpKind::Sort:
                     values[idx_node] = mlx::core::sort(values.at(node.lhs), node.index);
                     break;
@@ -2245,7 +2261,8 @@ bool mlx_tape_inline(MLXTapeHandle handle,
                 orig.inputs[i] = ni;
             }
         }
-        if (orig.kind == TapeOpKind::BroadcastInDim || orig.kind == TapeOpKind::Reshape) {
+        if (orig.kind == TapeOpKind::BroadcastInDim || orig.kind == TapeOpKind::Reshape ||
+            orig.kind == TapeOpKind::AsStrided || orig.kind == TapeOpKind::RNGBits) {
             for (size_t i = 0; i < orig.shape.size(); ++i) {
                 if (orig.shape[i] <= -2) {
                     int32_t enc = -orig.shape[i] - 2;
