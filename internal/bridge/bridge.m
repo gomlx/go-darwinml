@@ -246,13 +246,13 @@ MPSGraphTensorHandle mpsgraph_constant_from_buffer(MPSGraphContextHandle handle,
         id<MTLBuffer> mtlBuf = (__bridge id<MTLBuffer>)bufH;
         NSArray<NSNumber*>* shapeArr = shapeArray(shape, rank);
         MPSDataType mpsType = toMPSDataType(dtype);
-        NSData* nsData = [NSData dataWithBytesNoCopy:mtlBuf.contents
-                                              length:(NSUInteger)nbytes
-                                         deallocator:^(void* bytes, NSUInteger length) {
-                                             (void)bytes;
-                                             (void)length;
-                                             (void)mtlBuf; // ARC retains mtlBuf until NSData is released
-                                         }];
+        NSData* nsData = [[NSData alloc] initWithBytesNoCopy:mtlBuf.contents
+                                                      length:(NSUInteger)nbytes
+                                                 deallocator:^(void* bytes, NSUInteger length) {
+                                                     (void)bytes;
+                                                     (void)length;
+                                                     (void)mtlBuf; // ARC retains mtlBuf until NSData is released
+                                                 }];
 
         MPSGraphTensor* tensor = [ctx.graph constantWithData:nsData
                                                        shape:shapeArr

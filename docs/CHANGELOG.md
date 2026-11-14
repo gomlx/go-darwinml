@@ -1,5 +1,6 @@
 - Next:
-  - Implemented zero-copy `Function.ConstantFromBuffer` for both `"mlx"` (`mlx_tape_add_constant_array` retaining `mlx::core::array` unified-memory storage) and `"mps"` (`mpsgraph_constant_from_buffer` using `NSData dataWithBytesNoCopy` retaining `id<MTLBuffer>`).
+  - Added dynamic-shape support to `RNGBitGenerator` in `"mlx:dynamic"` (`compute/mlx/conv_pool_norm.go`, `internal/mlxbridge/bridge.cpp`).
+  - Implemented zero-copy `Function.ConstantFromBuffer` for both `"mlx"` (`mlx_tape_add_constant_array` retaining `mlx::core::array` unified-memory storage) and `"mps"` (`mpsgraph_constant_from_buffer` using `[[NSData alloc] initWithBytesNoCopy:length:deallocator:]` retaining `id<MTLBuffer>`).
   - Replaced `shapes.AnonymousAxis` (`"?"`), `Backend.UniqueAxisName`, and `Function.nameAnonymousDynamicAxes` in `compute/mlx` with `shapes.UniqueAxisName` and `shapes.AxisNamesCompatible` (`compute/mlx/{backend,executable,function,conv_pool_norm,dotgeneral}.go`).
   - Added Apple MLX (`"mlx"` and `"mlx:dynamic"`) backend (`compute/mlx` and `internal/mlxbridge`), documented in [`docs/MLX.md`](MLX.md).
   - Updated `"mlx"` and `"mps"` backends for the expanded `DynamicOps` and `DataDependentOps` compliance suites:
