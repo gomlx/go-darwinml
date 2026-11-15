@@ -1,5 +1,10 @@
 # go-darwinml
 
+[![Documentation](https://img.shields.io/badge/docs-gomlx.github.io-blue.svg)](https://gomlx.github.io/)
+[![Sponsor GoMLX](https://img.shields.io/badge/Sponsor-GoMLX-white?logo=github&style=flat-square)](https://github.com/gomlx/gomlx/blob/main/README.md#-support-the-project)
+<br/>
+[![Darwin/arm64 Tests](https://github.com/gomlx/go-darwinml/actions/workflows/darwin_tests.yaml/badge.svg)](https://github.com/gomlx/go-darwinml/actions/workflows/darwin_tests.yaml)
+
 Apple Silicon hardware acceleration backends for [GoMLX](https://github.com/gomlx/gomlx) / [`github.com/gomlx/compute`](https://github.com/gomlx/compute).
 
 ## Backends
