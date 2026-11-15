@@ -1892,51 +1892,39 @@ bool mpsgraph_top_k(MPSGraphContextHandle handle,
             values = res[0];
         } else if (source.dataType == MPSDataTypeInt64 || source.dataType == MPSDataTypeUInt64) {
             // MPSGraph's gatherAlongAxis (and bottomK values output) on 64-bit integer tensors
-            // converts values through float on some macOS versions, losing precision beyond 53 bits.
-            // Reinterpret each 64-bit element as two 32-bit UInt32 words (trailing dimension * 2),
-            // gather along the expanded indices, and reinterpret back to the original 64-bit dtype.
-            MPSGraphTensor* words = [ctx.graph reinterpretCastTensor:source
-                                                              toType:MPSDataTypeUInt32
-                                                                name:nil];
-            NSArray<NSNumber*>* idxShape = indices.shape;
-            NSMutableArray<NSNumber*>* expandedIdxShape = [NSMutableArray arrayWithArray:idxShape];
-            [expandedIdxShape addObject:@1];
-            MPSGraphTensor* expandedIdx = [ctx.graph reshapeTensor:indices
-                                                         withShape:expandedIdxShape
-                                                              name:nil];
-            NSMutableArray<NSNumber*>* bcastIdxShape = [NSMutableArray arrayWithArray:idxShape];
-            [bcastIdxShape addObject:@2];
-            expandedIdx = [ctx.graph broadcastTensor:expandedIdx
-                                             toShape:bcastIdxShape
-                                                name:nil];
-            NSMutableArray<NSNumber*>* wordIdxShape = [NSMutableArray arrayWithArray:idxShape];
-            NSUInteger lastIdx = wordIdxShape.count - 1;
-            wordIdxShape[lastIdx] = @(wordIdxShape[lastIdx].unsignedIntegerValue * 2);
-            if ((NSUInteger)axis == lastIdx) {
-                MPSGraphTensor* two = [ctx.graph constantWithScalar:2 dataType:expandedIdx.dataType];
-                MPSGraphTensor* baseIdx = [ctx.graph multiplicationWithPrimaryTensor:expandedIdx
-                                                                     secondaryTensor:two
-                                                                                name:nil];
-                MPSGraphTensor* wordOffset = [ctx.graph coordinateAlongAxis:(NSInteger)(bcastIdxShape.count - 1)
-                                                                  withShape:bcastIdxShape
-                                                                       name:nil];
-                if (wordOffset.dataType != baseIdx.dataType) {
-                    wordOffset = [ctx.graph castTensor:wordOffset toType:baseIdx.dataType name:nil];
-                }
-                expandedIdx = [ctx.graph additionWithPrimaryTensor:baseIdx
-                                                   secondaryTensor:wordOffset
-                                                              name:nil];
-            }
-            expandedIdx = [ctx.graph reshapeTensor:expandedIdx
-                                         withShape:wordIdxShape
-                                              name:nil];
-            MPSGraphTensor* gatheredWords = [ctx.graph gatherAlongAxis:(NSInteger)axis
-                                                     withUpdatesTensor:words
-                                                         indicesTensor:expandedIdx
-                                                                  name:nil];
-            values = [ctx.graph reinterpretCastTensor:gatheredWords
-                                               toType:source.dataType
-                                                 name:nil];
+            // converts values through float32 on some macOS versions, losing precision beyond 24 bits.
+            // Split each 64-bit integer into low and high 32-bit UInt32 tensors, gather each with
+            // gatherAlongAxis (which is exact for 32-bit integers), and recombine.
+            MPSGraphTensor* u64 = (source.dataType == MPSDataTypeUInt64)
+                ? source
+                : [ctx.graph castTensor:source toType:MPSDataTypeUInt64 name:nil];
+            MPSGraphTensor* shift32 = [ctx.graph constantWithScalar:32 dataType:MPSDataTypeUInt64];
+            MPSGraphTensor* lo32 = [ctx.graph castTensor:u64 toType:MPSDataTypeUInt32 name:nil];
+            MPSGraphTensor* hi64 = [ctx.graph bitwiseRightShiftWithPrimaryTensor:u64
+                                                                 secondaryTensor:shift32
+                                                                            name:nil];
+            MPSGraphTensor* hi32 = [ctx.graph castTensor:hi64 toType:MPSDataTypeUInt32 name:nil];
+
+            MPSGraphTensor* gLo32 = [ctx.graph gatherAlongAxis:(NSInteger)axis
+                                             withUpdatesTensor:lo32
+                                                 indicesTensor:indices
+                                                          name:nil];
+            MPSGraphTensor* gHi32 = [ctx.graph gatherAlongAxis:(NSInteger)axis
+                                             withUpdatesTensor:hi32
+                                                 indicesTensor:indices
+                                                          name:nil];
+
+            MPSGraphTensor* gLo64 = [ctx.graph castTensor:gLo32 toType:MPSDataTypeUInt64 name:nil];
+            MPSGraphTensor* gHi64 = [ctx.graph castTensor:gHi32 toType:MPSDataTypeUInt64 name:nil];
+            MPSGraphTensor* gHiShifted = [ctx.graph bitwiseLeftShiftWithPrimaryTensor:gHi64
+                                                                      secondaryTensor:shift32
+                                                                                 name:nil];
+            MPSGraphTensor* gU64 = [ctx.graph bitwiseORWithPrimaryTensor:gLo64
+                                                         secondaryTensor:gHiShifted
+                                                                    name:nil];
+            values = (source.dataType == MPSDataTypeUInt64)
+                ? gU64
+                : [ctx.graph castTensor:gU64 toType:source.dataType name:nil];
         } else {
             values = [ctx.graph gatherAlongAxis:(NSInteger)axis
                               withUpdatesTensor:source
