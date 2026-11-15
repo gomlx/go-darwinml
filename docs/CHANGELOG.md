@@ -1,4 +1,5 @@
 - Next:
+  - Added Darwin/arm64 GitHub Actions CI workflow (`.github/workflows/darwin_tests.yaml`) and status badges to `README.md`.
   - Added dynamic-shape support to `RNGBitGenerator` in `"mlx:dynamic"` (`compute/mlx/conv_pool_norm.go`, `internal/mlxbridge/bridge.cpp`).
   - Implemented zero-copy `Function.ConstantFromBuffer` for both `"mlx"` (`mlx_tape_add_constant_array` retaining `mlx::core::array` unified-memory storage) and `"mps"` (`mpsgraph_constant_from_buffer` using `[[NSData alloc] initWithBytesNoCopy:length:deallocator:]` retaining `id<MTLBuffer>`).
   - Replaced `shapes.AnonymousAxis` (`"?"`), `Backend.UniqueAxisName`, and `Function.nameAnonymousDynamicAxes` in `compute/mlx` with `shapes.UniqueAxisName` and `shapes.AxisNamesCompatible` (`compute/mlx/{backend,executable,function,conv_pool_norm,dotgeneral}.go`).
