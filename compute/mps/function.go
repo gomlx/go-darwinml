@@ -1175,6 +1175,8 @@ func (f *Function) Clamp(min, x, max compute.Value) (compute.Value, error) {
 	return &graphNode{tensor: tensor, shape: outShape, owner: f}, nil
 }
 
+// Slice extracts a slice from operand specified by starts, limits, and strides.
+// Packed sub-byte dtypes are not supported directly; Bitcast to Uint8 or ConvertDType first.
 func (f *Function) Slice(operand compute.Value, starts, limits, strides []int) (compute.Value, error) {
 	node, err := f.resolveNode(operand)
 	if err != nil {

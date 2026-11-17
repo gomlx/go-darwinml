@@ -17,6 +17,8 @@ import (
 
 // Gather implements the XLA-style Gather operation.
 //
+// Packed sub-byte dtypes are not supported directly; use QuantizedGather or Bitcast to Uint8 first.
+//
 // Strategy: decompose the general XLA Gather into MPSGraph operations.
 //
 // For the common embedding-lookup pattern (single indexed axis, gather full slices),

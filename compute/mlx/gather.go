@@ -17,6 +17,7 @@ import (
 )
 
 // Gather extracts slices from operand at the given startIndices.
+// Packed sub-byte dtypes are not supported directly; use QuantizedGather or Bitcast to Uint8 first.
 func (f *Function) Gather(
 	operand, startIndices compute.Value,
 	indexVectorAxis int,

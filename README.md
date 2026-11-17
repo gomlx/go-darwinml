@@ -90,7 +90,7 @@ See [`docs/MPSGraph.md`](docs/MPSGraph.md) and [`docs/MLX.md`](docs/MLX.md) for 
 - **Unsupported Operations**:
   - **Control flow**: `If` (`OpTypeIf`) and `While` (`OpTypeWhile`) are not supported (`Call` is supported via tape inlining, and `Sort` is supported for standard ascending/descending comparators).
   - **Pooling scatter sum**: `SelectAndScatterSum` (`SelectAndScatterMax` and `SelectAndScatterMin` are supported).
-  - **FFT, collective & quantized fused ops**: `FFT`, `AllReduce`, `FusedQuantizedDense`, `QuantizedEmbeddingLookup`.
+  - **FFT, collective & quantized fused ops**: `FFT`, `AllReduce`, `FusedQuantizedDense`, `QuantizedGather`.
 
 ### `"mps"` Backend
 - **Unsupported DTypes**: Apple Metal / `MPSGraph` does not support 64-bit floats (`Float64`), complex numbers (`Complex64`, `Complex128`), or sub-byte integer types (`Int2`, `Int4`, `Uint2`, `Uint4`).
@@ -99,7 +99,7 @@ See [`docs/MPSGraph.md`](docs/MPSGraph.md) and [`docs/MLX.md`](docs/MLX.md) for 
   - **Bit-level & bitwise reduction ops**: `Bitcast`, `BitCount`, `Clz`, `ReduceBitwiseAnd`, `ReduceBitwiseOr`, `ReduceBitwiseXor`, `ReduceLogicalXor`.
   - **Pooling scatter variants**: `SelectAndScatterSum`, `SelectAndScatterMin` (`SelectAndScatterMax` is supported).
   - **Dynamic shape ops**: `DynamicShapesNone`.
-  - **Collective & quantized fused ops**: `AllReduce`, `FusedQuantizedDense`, `QuantizedEmbeddingLookup`.
+  - **Collective & quantized fused ops**: `AllReduce`, `FusedQuantizedDense`, `QuantizedGather`.
   - **Barriers**: `OptimizationBarrier`, `SchedulingBarrier`.
   - *(Note: Operations with GoMLX graph decompositions, such as `CumSum` and `CumMax`, automatically fall back to their decomposed implementations).*
 
