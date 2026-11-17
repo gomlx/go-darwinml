@@ -167,4 +167,10 @@ var backendCapabilities = compute.Capabilities{
 		dtypes.Uint64:   true,
 		dtypes.BFloat16: true,
 	},
+
+	RNGAlgorithms: map[compute.RNGAlgorithm]bool{
+		compute.RNGDefault:  true,
+		compute.RNGThreeFry: true,
+	},
+	DefaultRNGAlgorithm: compute.RNGThreeFry,
 }

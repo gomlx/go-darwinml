@@ -1968,17 +1968,27 @@ func (f *Function) DynamicUpdateSlice(operand, update compute.Value, startIndice
 // RNG
 // ===========================================================================
 
-func (f *Function) RNGBitGenerator(state compute.Value, shape shapes.Shape) (newState, values compute.Value, err error) {
+// RNGBitGenerator generates a tensor of uniformly distributed random bits using the
+// specified Pseudo-Random Number Generator (PRNG) algorithm and advances the state.
+//
+// Supports [compute.RNGDefault] (resolved to [compute.RNGThreeFry]) and [compute.RNGThreeFry]
+// with bit-exact OpenXLA ThreeFry-2x32-20 semantics.
+func (f *Function) RNGBitGenerator(
+	state compute.Value,
+	shape shapes.Shape,
+	algorithm compute.RNGAlgorithm,
+) (newState, values compute.Value, err error) {
 	stateNode, err := f.resolveNode(state)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "RNGBitGenerator: state")
 	}
 
-	// Validate state shape: expects [3]uint64 per GoMLX convention.
-	expectedStateShape := compute.RNGStateShape
-	if !stateNode.shape.Equal(expectedStateShape) {
-		return nil, nil, errors.Errorf("RNGBitGenerator: expected state shape %s, got %s",
-			expectedStateShape, stateNode.shape)
+	expectedStateShape, err := backendCapabilities.RNGStateShape(algorithm)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, _, err := shapeinference.RNGBitGenerator(expectedStateShape, stateNode.shape, shape); err != nil {
+		return nil, nil, err
 	}
 	if err := checkDTypeSupported(shape.DType); err != nil {
 		return nil, nil, errors.Wrap(err, "RNGBitGenerator")
@@ -1988,147 +1998,271 @@ func (f *Function) RNGBitGenerator(state compute.Value, shape shapes.Shape) (new
 			"RNGBitGenerator: dynamic shape %s is not supported in %q backend", shape, BackendName)
 	}
 
-	dims := toInt64Slice(shape.Dimensions)
+	resolved := backendCapabilities.ResolveRNGAlgorithm(algorithm)
+	if resolved != compute.RNGThreeFry {
+		return nil, nil, errors.Wrapf(compute.ErrNotImplemented,
+			"RNGBitGenerator: RNG algorithm %s is not natively supported in %q backend", algorithm, BackendName)
+	}
 
-	// GoMLX's RandomUniform calls RNGBitGenerator with Uint32 dtype to get random bits,
-	// then converts to float: ConvertDType(bits, Float32) * (1/2^32).
-	// MPSGraph only supports float types for random generation (float16, bfloat16, float32).
-	// Strategy: generate Float32 uniform [0, 1), scale to [0, 2^32) so the subsequent
-	// ConvertDType(Uint32→Float32) is a no-op cast and MulScalar(1/2^32) produces [0, 1).
-	var valuesTensor bridge.Tensor
-	if shape.DType.IsFloat() {
-		// Direct generation for float types.
-		bridgeDType := dtypeToBridgeDType(shape.DType)
-		valuesTensor, err = f.ctx().RandomUniform(bridgeDType, dims)
+	return f.rngThreeFry(stateNode, shape)
+}
+
+func (f *Function) rngSliceScalar(arr compute.Value, idx int) (compute.Value, error) {
+	s, err := f.Slice(arr, []int{idx}, []int{idx + 1}, []int{1})
+	if err != nil {
+		return nil, err
+	}
+	return f.Reshape(s)
+}
+
+// rngThreeFry implements OpenXLA-compatible ThreeFry-2x32-20 on [2]uint64 state.
+func (f *Function) rngThreeFry(stateNode *graphNode, shape shapes.Shape) (newState, values compute.Value, err error) {
+	numElems := shape.Size()
+	if numElems == 0 {
+		emptyVal, err := f.Constant(dtypes.MakeAnySlice(shape.DType, 0), shape.Dimensions...)
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "RNGBitGenerator")
+			return nil, nil, errors.Wrap(err, "RNGBitGenerator: empty output")
 		}
-	} else if shape.DType == dtypes.Uint64 || shape.DType == dtypes.Int64 {
-		// For 64-bit integer types, generate two 32-bit uniform random chunks and combine (hi << 32) | lo.
-		dims2 := append([]int64{2}, dims...)
-		u, err := f.ctx().RandomUniform(dtypeToBridgeDType(dtypes.Float32), dims2)
+		return stateNode, emptyVal, nil
+	}
+
+	key64, err := f.rngSliceScalar(stateNode, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	ctr64, err := f.rngSliceScalar(stateNode, 1)
+	if err != nil {
+		return nil, nil, err
+	}
+	shift32U64, err := f.Constant([]uint64{32})
+	if err != nil {
+		return nil, nil, err
+	}
+	split64 := func(v compute.Value) (compute.Value, compute.Value, error) {
+		lo, err := f.ConvertDType(v, dtypes.Uint32)
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "RNGBitGenerator: RandomUniform(Float32)")
+			return nil, nil, err
 		}
-		scaleTensor, err := f.makeScalarConst(4294967296.0, dtypes.Float32) // 2^32
+		hi64, err := f.ShiftRightLogical(v, shift32U64)
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "RNGBitGenerator: scale constant")
+			return nil, nil, err
 		}
-		u, err = f.ctx().Mul(u, scaleTensor)
+		hi, err := f.ConvertDType(hi64, dtypes.Uint32)
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "RNGBitGenerator: scale")
+			return nil, nil, err
 		}
-		u32, err := f.ctx().Cast(u, dtypeToBridgeDType(dtypes.Uint32))
+		return lo, hi, nil
+	}
+	key0, key1, err := split64(key64)
+	if err != nil {
+		return nil, nil, err
+	}
+	ctr0, ctr1, err := split64(ctr64)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	wordsPerElem := 1
+	if shape.DType == dtypes.Uint64 {
+		wordsPerElem = 2
+	}
+	numWords := numElems * wordsPerElem
+	numBlocks := (numWords + 1) / 2
+
+	blockIota, err := f.Iota(shapes.Make(dtypes.Uint32, numBlocks), 0)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	c0, err := f.Add(blockIota, ctr0)
+	if err != nil {
+		return nil, nil, err
+	}
+	carryBool, err := f.LessThan(c0, ctr0)
+	if err != nil {
+		return nil, nil, err
+	}
+	carryU32, err := f.ConvertDType(carryBool, dtypes.Uint32)
+	if err != nil {
+		return nil, nil, err
+	}
+	c1, err := f.Add(ctr1, carryU32)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	magicConst, err := f.Constant([]uint32{0x1BD11BDA})
+	if err != nil {
+		return nil, nil, err
+	}
+	k0XorK1, err := f.BitwiseXor(key0, key1)
+	if err != nil {
+		return nil, nil, err
+	}
+	key2Val, err := f.BitwiseXor(k0XorK1, magicConst)
+	if err != nil {
+		return nil, nil, err
+	}
+	ks := [3]compute.Value{key0, key1, key2Val}
+
+	x0, err := f.Add(c0, ks[0])
+	if err != nil {
+		return nil, nil, err
+	}
+	x1, err := f.Add(c1, ks[1])
+	if err != nil {
+		return nil, nil, err
+	}
+
+	rotations := [8]int{13, 15, 26, 6, 17, 29, 16, 24}
+	var rotLeftConsts, rotRightConsts [8]compute.Value
+	for i, r := range rotations {
+		if rotLeftConsts[i], err = f.Constant([]uint32{uint32(r)}); err != nil {
+			return nil, nil, err
+		}
+		if rotRightConsts[i], err = f.Constant([]uint32{uint32(32 - r)}); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	for r := range 20 {
+		x0, err = f.Add(x0, x1)
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "RNGBitGenerator: cast Uint32")
+			return nil, nil, err
 		}
-		u64, err := f.ctx().Cast(u32, dtypeToBridgeDType(dtypes.Uint64))
+		ri := r % 8
+		shl, err := f.ShiftLeft(x1, rotLeftConsts[ri])
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "RNGBitGenerator: cast Uint64")
+			return nil, nil, err
 		}
-		starts0 := make([]int64, len(dims2))
-		ends0 := make([]int64, len(dims2))
-		starts1 := make([]int64, len(dims2))
-		ends1 := make([]int64, len(dims2))
-		strides := make([]int64, len(dims2))
-		for i, d := range dims2 {
-			strides[i] = 1
-			ends0[i] = d
-			ends1[i] = d
-		}
-		ends0[0] = 1
-		starts1[0] = 1
-		ends1[0] = 2
-		hi, err := f.ctx().Slice(u64, starts0, ends0, strides)
+		shr, err := f.ShiftRightLogical(x1, rotRightConsts[ri])
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "RNGBitGenerator: slice hi")
+			return nil, nil, err
 		}
-		lo, err := f.ctx().Slice(u64, starts1, ends1, strides)
+		rot, err := f.BitwiseOr(shl, shr)
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "RNGBitGenerator: slice lo")
+			return nil, nil, err
 		}
-		if len(dims) > 0 {
-			hi, err = f.ctx().Reshape(hi, dims)
-			if err != nil {
-				return nil, nil, errors.Wrap(err, "RNGBitGenerator: reshape hi")
+		x1, err = f.BitwiseXor(rot, x0)
+		if err != nil {
+			return nil, nil, err
+		}
+		if (r+1)%4 == 0 {
+			inj := (r + 1) / 4
+			if x0, err = f.Add(x0, ks[inj%3]); err != nil {
+				return nil, nil, err
 			}
-			lo, err = f.ctx().Reshape(lo, dims)
+			injConst, err := f.Constant([]uint32{uint32(inj)})
 			if err != nil {
-				return nil, nil, errors.Wrap(err, "RNGBitGenerator: reshape lo")
+				return nil, nil, err
 			}
-		} else {
-			hi, err = f.ctx().Reshape(hi, []int64{1})
+			kInj, err := f.Add(ks[(inj+1)%3], injConst)
 			if err != nil {
-				return nil, nil, errors.Wrap(err, "RNGBitGenerator: reshape hi")
+				return nil, nil, err
 			}
-			lo, err = f.ctx().Reshape(lo, []int64{1})
-			if err != nil {
-				return nil, nil, errors.Wrap(err, "RNGBitGenerator: reshape lo")
+			if x1, err = f.Add(x1, kInj); err != nil {
+				return nil, nil, err
 			}
 		}
-		shift32, err := f.makeScalarConst(32, dtypes.Uint64)
+	}
+
+	x0Col, err := f.Reshape(x0, numBlocks, 1)
+	if err != nil {
+		return nil, nil, err
+	}
+	x1Col, err := f.Reshape(x1, numBlocks, 1)
+	if err != nil {
+		return nil, nil, err
+	}
+	paired, err := f.Concatenate(1, x0Col, x1Col)
+	if err != nil {
+		return nil, nil, err
+	}
+	flatWords, err := f.Reshape(paired, numBlocks*2)
+	if err != nil {
+		return nil, nil, err
+	}
+	if numWords < numBlocks*2 {
+		flatWords, err = f.Slice(flatWords, []int{0}, []int{numWords}, []int{1})
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "RNGBitGenerator: shift32")
+			return nil, nil, err
 		}
-		hiShifted, err := f.ctx().ShiftLeft(hi, shift32)
+	}
+
+	var finalFlat compute.Value
+	if shape.DType == dtypes.Uint64 {
+		pairs, err := f.Reshape(flatWords, numElems, 2)
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "RNGBitGenerator: ShiftLeft")
+			return nil, nil, err
 		}
-		valuesTensor, err = f.ctx().BitwiseOr(hiShifted, lo)
+		lo32, err := f.Slice(pairs, []int{0, 0}, []int{numElems, 1}, []int{1, 1})
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "RNGBitGenerator: BitwiseOr")
+			return nil, nil, err
 		}
-		if shape.DType != dtypes.Uint64 {
-			valuesTensor, err = f.ctx().Cast(valuesTensor, dtypeToBridgeDType(shape.DType))
-			if err != nil {
-				return nil, nil, errors.Wrap(err, "RNGBitGenerator: final cast")
-			}
+		hi32, err := f.Slice(pairs, []int{0, 1}, []int{numElems, 2}, []int{1, 1})
+		if err != nil {
+			return nil, nil, err
+		}
+		lo64, err := f.ConvertDType(lo32, dtypes.Uint64)
+		if err != nil {
+			return nil, nil, err
+		}
+		hi64, err := f.ConvertDType(hi32, dtypes.Uint64)
+		if err != nil {
+			return nil, nil, err
+		}
+		hiShifted, err := f.ShiftLeft(hi64, shift32U64)
+		if err != nil {
+			return nil, nil, err
+		}
+		combined2D, err := f.BitwiseOr(lo64, hiShifted)
+		if err != nil {
+			return nil, nil, err
+		}
+		finalFlat, err = f.Reshape(combined2D, numElems)
+		if err != nil {
+			return nil, nil, err
 		}
 	} else {
-		// Integer type (typically Uint32): generate Float32 uniform, scale to [0, 2^32), and cast.
-		valuesTensor, err = f.ctx().RandomUniform(dtypeToBridgeDType(dtypes.Float32), dims)
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "RNGBitGenerator: RandomUniform(Float32)")
-		}
-		scaleTensor, err := f.makeScalarConst(4294967296.0, dtypes.Float32) // 2^32
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "RNGBitGenerator: scale constant")
-		}
-		valuesTensor, err = f.ctx().Mul(valuesTensor, scaleTensor)
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "RNGBitGenerator: scale")
-		}
-		valuesTensor, err = f.ctx().Cast(valuesTensor, dtypeToBridgeDType(dtypes.Uint32))
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "RNGBitGenerator: cast Uint32")
-		}
+		finalFlat = flatWords
 		if shape.DType != dtypes.Uint32 {
-			valuesTensor, err = f.ctx().Cast(valuesTensor, dtypeToBridgeDType(shape.DType))
+			finalFlat, err = f.ConvertDType(flatWords, shape.DType)
 			if err != nil {
-				return nil, nil, errors.Wrap(err, "RNGBitGenerator: final cast")
+				return nil, nil, err
 			}
 		}
 	}
 
-	// Advance the RNG state by adding 1 to the state tensor, so subsequent calls
-	// produce different random values.
-	one, err := f.makeScalarConst(1.0, stateNode.shape.DType)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "RNGBitGenerator: creating state increment")
+	if shape.Rank() == 0 {
+		values, err = f.Reshape(finalFlat)
+	} else {
+		values, err = f.Reshape(finalFlat, shape.Dimensions...)
 	}
-	// Broadcast to state shape.
-	stateDims := toInt64Slice(stateNode.shape.Dimensions)
-	one, err = f.ctx().BroadcastTo(one, stateDims)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "RNGBitGenerator: broadcasting state increment")
+		return nil, nil, err
 	}
-	newStateTensor, err := f.ctx().Add(stateNode.tensor, one)
+
+	numBlocksConst, err := f.Constant([]uint64{uint64(numBlocks)})
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "RNGBitGenerator: advancing state")
+		return nil, nil, err
 	}
-	newStateNode := &graphNode{tensor: newStateTensor, shape: stateNode.shape, owner: f}
-	valuesNode := &graphNode{tensor: valuesTensor, shape: shape, owner: f}
-	return newStateNode, valuesNode, nil
+	newCtr64, err := f.Add(ctr64, numBlocksConst)
+	if err != nil {
+		return nil, nil, err
+	}
+	key1D, err := f.Reshape(key64, 1)
+	if err != nil {
+		return nil, nil, err
+	}
+	ctr1D, err := f.Reshape(newCtr64, 1)
+	if err != nil {
+		return nil, nil, err
+	}
+	newState, err = f.Concatenate(0, key1D, ctr1D)
+	if err != nil {
+		return nil, nil, err
+	}
+	return newState, values, nil
 }
 
 // ===========================================================================

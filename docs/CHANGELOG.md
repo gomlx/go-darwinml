@@ -1,4 +1,7 @@
 - Next:
+  - Updated `RNGBitGenerator(state, shape, algorithm)` for `compute.RNGAlgorithm`:
+    - `compute/mlx` (`capabilities.go`, `conv_pool_norm.go`, `internal/mlxbridge/bridge.cpp`, `docs/MLX.md`): implemented stateful OpenXLA-exact `ThreeFry-2x32-20` (`RNGDefault` resolved to `RNGThreeFry` on `[2]uint64` state, supporting static and dynamic shapes) via vectorized `mlx::core` ops; unsupported explicit algorithms return `compute.ErrNotImplemented`.
+    - `compute/mps` (`capabilities.go`, `function.go`): replaced the stateless float-based workaround with stateful OpenXLA-exact `ThreeFry-2x32-20` (`RNGDefault` resolved to `RNGThreeFry`) built from integer MPSGraph ops.
   - Updated `QuantizedEmbeddingLookup` references to `QuantizedGather` (`README.md`, `docs/MLX.md`, inherited via `notimplemented.Function`), updated `Slice`/`Gather` docstrings (`compute/{mlx,mps}`), and bumped `github.com/gomlx/compute` dependency.
   - Added Darwin/arm64 GitHub Actions CI workflow (`.github/workflows/darwin_tests.yaml`) and status badges to `README.md`.
   - Added dynamic-shape support to `RNGBitGenerator` in `"mlx:dynamic"` (`compute/mlx/conv_pool_norm.go`, `internal/mlxbridge/bridge.cpp`).

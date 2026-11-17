@@ -1215,8 +1215,26 @@ func (f *Function) BatchNormGradient(
 // Random Number Generation (RNGBitGenerator)
 // ===========================================================================
 
-// RNGBitGenerator generates a tensor of random bits/values of the given shape and advances the PRNG state.
-func (f *Function) RNGBitGenerator(state compute.Value, shape shapes.Shape) (newState, values compute.Value, err error) {
+// RNGBitGenerator generates a tensor of uniformly distributed random bits of the given shape
+// and advances the PRNG state.
+//
+// Supports [compute.RNGDefault] (resolved to [compute.RNGThreeFry]) and [compute.RNGThreeFry]
+// with bit-exact OpenXLA ThreeFry-2x32-20 semantics on `[2]uint64` state (including dynamic shapes
+// in `"mlx:dynamic"`). Explicit unsupported algorithms return [compute.ErrNotImplemented].
+func (f *Function) RNGBitGenerator(
+	state compute.Value,
+	shape shapes.Shape,
+	algorithm compute.RNGAlgorithm,
+) (newState, values compute.Value, err error) {
+	caps := f.builder.backend.Capabilities()
+	expectedStateShape, err := caps.RNGStateShape(algorithm)
+	if err != nil {
+		return nil, nil, err
+	}
+	if resolved := caps.ResolveRNGAlgorithm(algorithm); resolved != compute.RNGThreeFry {
+		return nil, nil, errors.Wrapf(compute.ErrNotImplemented,
+			"RNGBitGenerator: RNG algorithm %s is not natively supported in %q backend", algorithm, BackendName)
+	}
 	if err := f.builder.backend.checkDTypeSupported(shape.DType); err != nil {
 		return nil, nil, errors.Wrap(err, "RNGBitGenerator")
 	}
@@ -1229,9 +1247,9 @@ func (f *Function) RNGBitGenerator(state compute.Value, shape shapes.Shape) (new
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "RNGBitGenerator: state")
 	}
-	if !stateNode.shape.Equal(compute.RNGStateShape) {
-		return nil, nil, errors.Errorf("RNGBitGenerator: expected state shape %s, got %s",
-			compute.RNGStateShape, stateNode.shape)
+	newStateShape, valuesShape, err := shapeinference.RNGBitGenerator(expectedStateShape, stateNode.shape, shape)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	targetDims := slices.Clone(shape.Dimensions)
@@ -1256,7 +1274,7 @@ func (f *Function) RNGBitGenerator(state compute.Value, shape shapes.Shape) (new
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "RNGBitGenerator")
 	}
-	newState = &graphNode{id: newStateID, shape: stateNode.shape.Clone(), owner: f}
-	values = &graphNode{id: valuesID, shape: shape.Clone(), owner: f}
+	newState = &graphNode{id: newStateID, shape: newStateShape, owner: f}
+	values = &graphNode{id: valuesID, shape: valuesShape, owner: f}
 	return newState, values, nil
 }
