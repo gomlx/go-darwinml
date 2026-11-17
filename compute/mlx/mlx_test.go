@@ -229,16 +229,85 @@ func TestSortCustomComparatorNotImplemented(t *testing.T) {
 	}
 }
 
-func TestCompliance(t *testing.T) {
-	for _, cfg := range []string{"", "dynamic", "dynamic,lazy_contiguous"} {
-		name := cfg
-		if name == "" {
-			name = "compiled"
+func TestScatterDynamicShapes(t *testing.T) {
+	backend, err := mlx.New("dynamic")
+	if err != nil {
+		t.Fatalf("mlx.New(\"dynamic\") failed: %v", err)
+	}
+	defer backend.Finalize()
+
+	builder := backend.Builder("scatter_dyn_test")
+	fn := builder.Main()
+
+	opShape := shapes.MakeDynamic(dtypes.Float32, []int{shapes.DynamicDim, shapes.DynamicDim}, []string{"rows", "cols"})
+	idxShape := shapes.MakeDynamic(dtypes.Int32, []int{shapes.DynamicDim, shapes.DynamicDim, 1}, []string{shapes.UniqueAxisName("i0"), shapes.UniqueAxisName("i1"), ""})
+	updShape := shapes.MakeDynamic(dtypes.Float32, []int{shapes.DynamicDim, shapes.DynamicDim, shapes.DynamicDim}, []string{shapes.UniqueAxisName("u0"), shapes.UniqueAxisName("u1"), "cols"})
+
+	op, err := fn.Parameter("op", opShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter op: %v", err)
+	}
+	idx, err := fn.Parameter("idx", idxShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter idx: %v", err)
+	}
+	upd, err := fn.Parameter("upd", updShape, nil)
+	if err != nil {
+		t.Fatalf("Parameter upd: %v", err)
+	}
+	out, err := fn.ScatterSum(op, idx, upd, 2, []int{2}, []int{0}, []int{0}, false, false)
+	if err != nil {
+		t.Fatalf("ScatterSum: %v", err)
+	}
+	if err := fn.Return([]compute.Value{out}, nil); err != nil {
+		t.Fatalf("Return: %v", err)
+	}
+	exec, err := builder.Compile()
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	defer exec.Finalize()
+
+	// Valid empty batch (0, 2)
+	opBuf, _ := backend.BufferFromFlatData(0, []float32{1, 2, 3, 4, 5, 6}, shapes.Make(dtypes.Float32, 2, 3))
+	idxBuf, _ := backend.BufferFromFlatData(0, []int32{}, shapes.Make(dtypes.Int32, 0, 2, 1))
+	updBuf, _ := backend.BufferFromFlatData(0, []float32{}, shapes.Make(dtypes.Float32, 0, 2, 3))
+	outs, err := exec.Execute([]compute.Buffer{opBuf, idxBuf, updBuf}, []bool{true, true, true}, 0)
+	if err != nil {
+		t.Fatalf("Execute empty batch failed: %v", err)
+	}
+	got := make([]float32, 6)
+	if err := outs[0].ToFlatData(got); err != nil {
+		t.Fatalf("ToFlatData failed: %v", err)
+	}
+	_ = outs[0].Finalize()
+	for i, want := range []float32{1, 2, 3, 4, 5, 6} {
+		if got[i] != want {
+			t.Fatalf("empty batch got[%d]=%v, want %v", i, got[i], want)
 		}
-		t.Run(name, func(t *testing.T) {
-			b, err := mlx.New(cfg)
+	}
+
+	// Swapped batch dims (2, 3) vs (3, 2) have identical element count and must still error.
+	opBuf2, _ := backend.BufferFromFlatData(0, make([]float32, 12), shapes.Make(dtypes.Float32, 4, 3))
+	idxBuf2, _ := backend.BufferFromFlatData(0, make([]int32, 6), shapes.Make(dtypes.Int32, 2, 3, 1))
+	updBuf2, _ := backend.BufferFromFlatData(0, make([]float32, 18), shapes.Make(dtypes.Float32, 3, 2, 3))
+	outs2, err := exec.Execute([]compute.Buffer{opBuf2, idxBuf2, updBuf2}, []bool{true, true, true}, 0)
+	for _, o := range outs2 {
+		if o != nil {
+			_ = o.Finalize()
+		}
+	}
+	if err == nil {
+		t.Fatalf("expected runtime error for swapped batch dims (2, 3) vs (3, 2), got nil")
+	}
+}
+
+func TestCompliance(t *testing.T) {
+	for _, cfg := range []string{"mlx", "mlx:dynamic"} {
+		t.Run(cfg, func(t *testing.T) {
+			b, err := compute.NewWithConfig(cfg)
 			if err != nil {
-				t.Fatalf("mlx.New(%q) failed: %v", cfg, err)
+				t.Fatalf("compute.NewWithConfig(%q) failed: %v", cfg, err)
 			}
 			defer b.Finalize()
 
