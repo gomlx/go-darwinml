@@ -168,4 +168,10 @@ var baseCapabilities = compute.Capabilities{
 		dtypes.Float32:   true,
 		dtypes.Complex64: true,
 	},
+
+	RNGAlgorithms: map[compute.RNGAlgorithm]bool{
+		compute.RNGDefault:  true,
+		compute.RNGThreeFry: true,
+	},
+	DefaultRNGAlgorithm: compute.RNGThreeFry,
 }

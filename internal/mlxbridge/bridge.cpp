@@ -850,58 +850,112 @@ mlx::core::array evalSelectAndScatter(
     return out_padded;
 }
 
-mlx::core::array evalRNGBits(const mlx::core::array& state, const mlx::core::Shape& shape, mlx::core::Dtype dt) {
+size_t threeFryBlockCount(const mlx::core::Shape& shape, mlx::core::Dtype dt) {
+    size_t num_elems = 1;
     for (int32_t d : shape) {
         if (d == 0) {
-            return mlx::core::zeros(shape, dt);
+            return 0;
         }
+        num_elems *= static_cast<size_t>(d);
     }
-    mlx::core::array s_contig = state.flags().row_contiguous ? state : mlx::core::contiguous(state);
-    mlx::core::array s32 = mlx::core::reshape(mlx::core::view(s_contig, mlx::core::uint32), {6});
-    mlx::core::array k0 = mlx::core::slice(s32, {0}, {2});
-    mlx::core::array k1 = mlx::core::slice(s32, {2}, {4});
-    mlx::core::array k2 = mlx::core::slice(s32, {4}, {6});
-    mlx::core::array key = mlx::core::bitwise_xor(mlx::core::bitwise_xor(k0, k1), k2);
-    auto [next_key, subkey] = mlx::core::random::split(key);
-    (void)next_key;
+    size_t words_per_elem = (dt == mlx::core::uint64 || dt == mlx::core::int64) ? 2 : 1;
+    size_t num_words = num_elems * words_per_elem;
+    return (num_words + 1) / 2;
+}
 
-    if (dt == mlx::core::bool_) {
-        mlx::core::array b = mlx::core::random::bits(shape, 1, subkey);
-        return mlx::core::not_equal(
-            mlx::core::bitwise_and(b, mlx::core::array(uint8_t(1))),
-            mlx::core::array(uint8_t(0)));
+mlx::core::array evalThreeFryNextState(
+    const mlx::core::array& state,
+    const mlx::core::Shape& shape,
+    mlx::core::Dtype dt
+) {
+    mlx::core::array s = state.flags().row_contiguous ? state : mlx::core::contiguous(state);
+    size_t num_blocks = threeFryBlockCount(shape, dt);
+    if (num_blocks == 0) {
+        return s;
     }
-    if (dt == mlx::core::complex64) {
-        auto [k_re, k_im] = mlx::core::random::split(subkey);
-        mlx::core::array re = mlx::core::random::uniform(shape, mlx::core::float32, k_re);
-        mlx::core::array im = mlx::core::random::uniform(shape, mlx::core::float32, k_im);
-        return evalBinaryOp(MLX_BINARY_COMPLEX, re, im);
+    mlx::core::array key1d = mlx::core::slice(s, {0}, {1});
+    mlx::core::array ctr1d = mlx::core::slice(s, {1}, {2});
+    mlx::core::array new_ctr1d = mlx::core::add(ctr1d, mlx::core::array(static_cast<uint64_t>(num_blocks)));
+    return mlx::core::concatenate({key1d, new_ctr1d}, 0);
+}
+
+mlx::core::array evalThreeFryBits(
+    const mlx::core::array& state,
+    const mlx::core::Shape& shape,
+    mlx::core::Dtype dt
+) {
+    size_t num_blocks = threeFryBlockCount(shape, dt);
+    if (num_blocks == 0) {
+        return mlx::core::zeros(shape, dt);
     }
-    if (isFloatDType(dt)) {
-        return mlx::core::random::uniform(shape, dt, subkey);
+    size_t num_elems = 1;
+    for (int32_t d : shape) {
+        num_elems *= static_cast<size_t>(d);
     }
-    int width = static_cast<int>(dt.size());
-    if (width == 8) {
-        mlx::core::Shape shape32 = shape;
-        shape32.push_back(2);
-        mlx::core::array bits = mlx::core::random::bits(shape32, 4, subkey);
-        bits = mlx::core::view(bits, dt);
-        if (bits.shape() != shape) {
-            bits = mlx::core::reshape(bits, shape);
+    bool is_64bit = (dt == mlx::core::uint64 || dt == mlx::core::int64);
+    size_t words_per_elem = is_64bit ? 2 : 1;
+    size_t num_words = num_elems * words_per_elem;
+
+    mlx::core::array s = state.flags().row_contiguous ? state : mlx::core::contiguous(state);
+    mlx::core::array key64 = mlx::core::slice(s, {0}, {1});
+    mlx::core::array ctr64 = mlx::core::slice(s, {1}, {2});
+    mlx::core::array shift32 = mlx::core::array(uint64_t(32));
+
+    mlx::core::array key0 = mlx::core::reshape(mlx::core::astype(key64, mlx::core::uint32), {1});
+    mlx::core::array key1 = mlx::core::reshape(
+        mlx::core::astype(mlx::core::right_shift(key64, shift32), mlx::core::uint32), {1});
+    mlx::core::array key2 = mlx::core::bitwise_xor(
+        mlx::core::bitwise_xor(key0, key1), mlx::core::array(uint32_t(0x1BD11BDAu)));
+    mlx::core::array ks[3] = {key0, key1, key2};
+
+    mlx::core::array block_idx = mlx::core::arange(static_cast<double>(num_blocks), mlx::core::uint64);
+    mlx::core::array full_ctr = mlx::core::add(ctr64, block_idx);
+    mlx::core::array c0 = mlx::core::astype(full_ctr, mlx::core::uint32);
+    mlx::core::array c1 = mlx::core::astype(mlx::core::right_shift(full_ctr, shift32), mlx::core::uint32);
+
+    mlx::core::array x0 = mlx::core::add(c0, ks[0]);
+    mlx::core::array x1 = mlx::core::add(c1, ks[1]);
+
+    static constexpr uint32_t rotations[8] = {13, 15, 26, 6, 17, 29, 16, 24};
+    for (int r = 0; r < 20; ++r) {
+        x0 = mlx::core::add(x0, x1);
+        uint32_t rot = rotations[r % 8];
+        mlx::core::array x1_rot = mlx::core::bitwise_or(
+            mlx::core::left_shift(x1, mlx::core::array(rot)),
+            mlx::core::right_shift(x1, mlx::core::array(uint32_t(32 - rot))));
+        x1 = mlx::core::bitwise_xor(x1_rot, x0);
+        if ((r + 1) % 4 == 0) {
+            int inj = (r + 1) / 4;
+            x0 = mlx::core::add(x0, ks[inj % 3]);
+            x1 = mlx::core::add(x1, mlx::core::add(ks[(inj + 1) % 3], mlx::core::array(static_cast<uint32_t>(inj))));
         }
-        return bits;
     }
-    mlx::core::array bits = mlx::core::random::bits(shape, width, subkey);
-    if (bits.dtype() != dt) {
-        if (shape.empty()) {
-            bits = mlx::core::reshape(bits, {1});
-            bits = mlx::core::view(bits, dt);
-            bits = mlx::core::reshape(bits, {});
-        } else {
-            bits = mlx::core::view(bits, dt);
+
+    int32_t nb = static_cast<int32_t>(num_blocks);
+    mlx::core::array x0_col = mlx::core::reshape(x0, {nb, 1});
+    mlx::core::array x1_col = mlx::core::reshape(x1, {nb, 1});
+    mlx::core::array flat_words = mlx::core::reshape(
+        mlx::core::concatenate({x0_col, x1_col}, 1), {static_cast<int32_t>(num_blocks * 2)});
+    if (num_words < num_blocks * 2) {
+        flat_words = mlx::core::slice(flat_words, {0}, {static_cast<int32_t>(num_words)});
+    }
+
+    if (is_64bit) {
+        int32_t ne = static_cast<int32_t>(num_elems);
+        mlx::core::array pairs = mlx::core::reshape(flat_words, {ne, 2});
+        mlx::core::array lo32 = mlx::core::reshape(mlx::core::slice(pairs, {0, 0}, {ne, 1}), {ne});
+        mlx::core::array hi32 = mlx::core::reshape(mlx::core::slice(pairs, {0, 1}, {ne, 2}), {ne});
+        mlx::core::array out64 = mlx::core::bitwise_or(
+            mlx::core::astype(lo32, mlx::core::uint64),
+            mlx::core::left_shift(mlx::core::astype(hi32, mlx::core::uint64), shift32));
+        if (dt != mlx::core::uint64) {
+            out64 = mlx::core::astype(out64, dt);
         }
+        return mlx::core::reshape(out64, shape);
     }
-    return bits;
+
+    mlx::core::array out_flat = (dt == mlx::core::uint32) ? flat_words : mlx::core::astype(flat_words, dt);
+    return mlx::core::reshape(out_flat, shape);
 }
 
 mlx::core::array evalNonZero(const mlx::core::array& a, bool transpose) {
@@ -983,7 +1037,8 @@ struct MLXTape {
                 if (child >= 0) reachable[child] = 1;
             }
             if (n.kind == TapeOpKind::BroadcastInDim || n.kind == TapeOpKind::Reshape ||
-                n.kind == TapeOpKind::AsStrided || n.kind == TapeOpKind::RNGBits) {
+                n.kind == TapeOpKind::AsStrided || n.kind == TapeOpKind::RNGBits ||
+                n.kind == TapeOpKind::RNGNextState) {
                 for (int32_t d : n.shape) {
                     if (d <= -2) {
                         int32_t ref_node = (-d - 2) / 16;
@@ -1374,10 +1429,6 @@ struct MLXTape {
                         node.extra_ints2);
                     break;
                 case TapeOpKind::RNGNextState:
-                    values[idx_node] = mlx::core::add(
-                        values.at(node.lhs),
-                        mlx::core::array(uint64_t(1)));
-                    break;
                 case TapeOpKind::RNGBits: {
                     mlx::core::Shape target_shape = node.shape;
                     for (size_t i = 0; i < target_shape.size(); ++i) {
@@ -1388,7 +1439,9 @@ struct MLXTape {
                             target_shape[i] = values.at(ref_node).shape(ref_axis);
                         }
                     }
-                    values[idx_node] = evalRNGBits(values.at(node.lhs), target_shape, node.dtype);
+                    values[idx_node] = (node.kind == TapeOpKind::RNGNextState)
+                        ? evalThreeFryNextState(values.at(node.lhs), target_shape, node.dtype)
+                        : evalThreeFryBits(values.at(node.lhs), target_shape, node.dtype);
                     break;
                 }
                 case TapeOpKind::Sort:
@@ -2262,7 +2315,8 @@ bool mlx_tape_inline(MLXTapeHandle handle,
             }
         }
         if (orig.kind == TapeOpKind::BroadcastInDim || orig.kind == TapeOpKind::Reshape ||
-            orig.kind == TapeOpKind::AsStrided || orig.kind == TapeOpKind::RNGBits) {
+            orig.kind == TapeOpKind::AsStrided || orig.kind == TapeOpKind::RNGBits ||
+            orig.kind == TapeOpKind::RNGNextState) {
             for (size_t i = 0; i < orig.shape.size(); ++i) {
                 if (orig.shape[i] <= -2) {
                     int32_t enc = -orig.shape[i] - 2;
@@ -2519,6 +2573,8 @@ bool mlx_tape_add_rng_bit_generator(MLXTapeHandle handle, int32_t state, int dty
     TapeNode state_node;
     state_node.kind = TapeOpKind::RNGNextState;
     state_node.lhs = state;
+    state_node.dtype = dt;
+    state_node.shape = toMLXShape(shape, rank);
     tape->nodes.push_back(std::move(state_node));
 
     int32_t values_id = static_cast<int32_t>(tape->nodes.size());
