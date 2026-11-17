@@ -5,8 +5,6 @@
 package mlx
 
 import (
-	"slices"
-
 	"github.com/gomlx/compute"
 	"github.com/gomlx/compute/dtypes"
 	"github.com/gomlx/compute/shapeinference"
@@ -139,36 +137,30 @@ func (f *Function) scatterOp(
 		return nil, errors.Wrap(err, opName)
 	}
 
-	if opNode.shape.IsDynamic() || idxNode.shape.IsDynamic() || updNode.shape.IsDynamic() {
+	if (opNode.shape.IsDynamic() || idxNode.shape.IsDynamic() || updNode.shape.IsDynamic()) && !f.builder.backend.dynamicShapes {
 		return nil, errors.Wrapf(compute.ErrNotImplemented,
-			"%s: dynamic shapes are not supported in %q backend", opName, BackendName)
+			"%s: dynamic shapes are not supported in %q backend (use %q to enable dynamic shapes)", opName, BackendName, "mlx:dynamic")
 	}
 	if opNode.shape.DType == dtypes.Complex64 && mlxOp != mlxbridge.ScatterSum {
 		return nil, errors.Wrapf(compute.ErrNotImplemented,
 			"%s: Complex64 is not supported for min/max scatter in %q backend", opName, BackendName)
 	}
-	if updNode.shape.Size() == 0 || outShape.Size() == 0 {
+	if (!updNode.shape.IsDynamic() && updNode.shape.Size() == 0) || (!outShape.IsDynamic() && outShape.Size() == 0) {
 		return f.Identity(opNode)
-	}
-
-	// Compute batch dimensions (scatterIndices dimensions excluding indexVectorAxis).
-	var batchDims []int
-	for ax, d := range idxNode.shape.Dimensions {
-		if ax != indexVectorAxis {
-			batchDims = append(batchDims, d)
-		}
 	}
 
 	// Step 1: Transpose updates so that batch axes come first and updateWindowAxes come last.
 	updID := updNode.id
 	updRank := updNode.shape.Rank()
 	winAxesSet := sets.MakeWith(updateWindowAxes...)
-	perm := make([]int, 0, updRank)
+	updBatchAxes := make([]int, 0, updRank-len(updateWindowAxes))
 	for ax := range updRank {
 		if !winAxesSet.Has(ax) {
-			perm = append(perm, ax)
+			updBatchAxes = append(updBatchAxes, ax)
 		}
 	}
+	perm := make([]int, 0, updRank)
+	perm = append(perm, updBatchAxes...)
 	perm = append(perm, updateWindowAxes...)
 	if !isIdentityPerm(perm) {
 		updID, err = f.builder.tape.AddTranspose(updID, perm)
@@ -177,22 +169,33 @@ func (f *Function) scatterOp(
 		}
 	}
 
-	// Step 2: Reshape updates to [batchDims..., win_0, ..., win_{opRank-1}], inserting size-1 dims
-	// at insertedWindowAxes as expected by mlx::core::scatter_*.
-	opRank := opNode.shape.Rank()
-	insertedSet := sets.MakeWith(insertedWindowAxes...)
-	mlxUpdDims := make([]int, 0, len(batchDims)+opRank)
-	mlxUpdDims = append(mlxUpdDims, batchDims...)
-	winIdx := 0
-	for d := range opRank {
-		if insertedSet.Has(d) {
-			mlxUpdDims = append(mlxUpdDims, 1)
-		} else {
-			mlxUpdDims = append(mlxUpdDims, updNode.shape.Dimensions[updateWindowAxes[winIdx]])
-			winIdx++
+	// Step 2: Reshape updates to [updBatchDims..., win_0, ..., win_{opRank-1}], inserting
+	// size-1 dims at insertedWindowAxes as expected by mlx::core::scatter_*.
+	// Encode updates' own dynamic axes so TapeOpKind::Scatter can validate batch and
+	// window dimensions against indices and operand at runtime.
+	if len(insertedWindowAxes) > 0 {
+		encodeUpdDim := func(ax int) int {
+			d := updNode.shape.Dimensions[ax]
+			if d == shapes.DynamicDim {
+				return -(2 + int(updNode.id)*16 + ax)
+			}
+			return d
 		}
-	}
-	if !slices.Equal(updNode.shape.Dimensions, mlxUpdDims) || !isIdentityPerm(perm) {
+		opRank := opNode.shape.Rank()
+		insertedSet := sets.MakeWith(insertedWindowAxes...)
+		mlxUpdDims := make([]int, 0, len(updBatchAxes)+opRank)
+		for _, ax := range updBatchAxes {
+			mlxUpdDims = append(mlxUpdDims, encodeUpdDim(ax))
+		}
+		winIdx := 0
+		for d := range opRank {
+			if insertedSet.Has(d) {
+				mlxUpdDims = append(mlxUpdDims, 1)
+			} else {
+				mlxUpdDims = append(mlxUpdDims, encodeUpdDim(updateWindowAxes[winIdx]))
+				winIdx++
+			}
+		}
 		updID, err = f.builder.tape.AddReshape(updID, mlxUpdDims)
 		if err != nil {
 			return nil, errors.Wrapf(err, "%s: reshape updates", opName)

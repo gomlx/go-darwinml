@@ -1302,6 +1302,39 @@ struct MLXTape {
                     const mlx::core::array& a = values.at(node.lhs);
                     const mlx::core::array& idx = values.at(node.rhs);
                     const mlx::core::array& upd = values.at(node.third);
+
+                    // Validate runtime shape compatibility (required for dynamic shapes).
+                    if (node.index < static_cast<int>(idx.ndim()) &&
+                        idx.shape(node.index) != static_cast<int32_t>(node.axes.size())) {
+                        throw std::invalid_argument(
+                            "Scatter: scatterIndices indexVectorAxis size mismatch at runtime");
+                    }
+                    std::vector<int32_t> idx_batch_dims;
+                    for (int ax = 0; ax < static_cast<int>(idx.ndim()); ++ax) {
+                        if (ax != node.index) {
+                            idx_batch_dims.push_back(idx.shape(ax));
+                        }
+                    }
+                    if (upd.ndim() != idx_batch_dims.size() + a.ndim()) {
+                        throw std::invalid_argument("Scatter: updates rank mismatch at runtime");
+                    }
+                    for (size_t k = 0; k < idx_batch_dims.size(); ++k) {
+                        if (upd.shape(static_cast<int>(k)) != idx_batch_dims[k]) {
+                            throw std::invalid_argument(
+                                "Scatter: batch dimension mismatch between indices and updates at runtime");
+                        }
+                    }
+                    for (size_t d = 0; d < a.ndim(); ++d) {
+                        if (upd.shape(static_cast<int>(idx_batch_dims.size() + d)) > a.shape(static_cast<int>(d))) {
+                            throw std::invalid_argument(
+                                "Scatter: update window dimension exceeds operand dimension at runtime");
+                        }
+                    }
+                    if (upd.size() == 0 || a.size() == 0) {
+                        values[idx_node] = a;
+                        break;
+                    }
+
                     std::vector<mlx::core::array> indices_vec;
                     if (!node.axes.empty()) {
                         if (node.index == static_cast<int>(idx.ndim())) {
