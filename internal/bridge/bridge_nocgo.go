@@ -115,6 +115,7 @@ func (c *Context) GreaterOrEqual(lhs, rhs Tensor) (Tensor, error) { return nil, 
 func (c *Context) Reshape(x Tensor, shape []int64) (Tensor, error)            { return nil, errNoCGo }
 func (c *Context) Transpose(x Tensor, permutation []int) (Tensor, error)      { return nil, errNoCGo }
 func (c *Context) Cast(x Tensor, dtype DType) (Tensor, error)                 { return nil, errNoCGo }
+func (c *Context) ReinterpretCast(x Tensor, dtype DType) (Tensor, error)      { return nil, errNoCGo }
 func (c *Context) BroadcastTo(x Tensor, shape []int64) (Tensor, error)        { return nil, errNoCGo }
 func (c *Context) Slice(x Tensor, starts, ends, strides []int64) (Tensor, error) { return nil, errNoCGo }
 func (c *Context) Concatenate(tensors []Tensor, axis int) (Tensor, error)      { return nil, errNoCGo }

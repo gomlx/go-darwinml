@@ -119,6 +119,8 @@ MPSGraphTensorHandle mpsgraph_transpose(MPSGraphContextHandle ctx, MPSGraphTenso
     int* permutation, int rank, MPSGraphError* error);
 MPSGraphTensorHandle mpsgraph_cast(MPSGraphContextHandle ctx, MPSGraphTensorHandle x,
     int dtype, MPSGraphError* error);
+MPSGraphTensorHandle mpsgraph_reinterpret_cast(MPSGraphContextHandle ctx, MPSGraphTensorHandle x,
+    int dtype, MPSGraphError* error);
 MPSGraphTensorHandle mpsgraph_broadcast_to(MPSGraphContextHandle ctx, MPSGraphTensorHandle x,
     int64_t* shape, int rank, MPSGraphError* error);
 MPSGraphTensorHandle mpsgraph_slice(MPSGraphContextHandle ctx, MPSGraphTensorHandle x,

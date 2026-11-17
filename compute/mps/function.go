@@ -279,8 +279,7 @@ func (f *Function) compileClosure() (*Executable, error) {
 	allFeeds = append(allFeeds, f.params...)
 	allFeeds = append(allFeeds, f.capturedLocalNodes...)
 
-	info := buildCompileInfo(allFeeds, f.outputs)
-	exec, err := ctx.Compile(info)
+	exec, nonZeroIndices, err := compileTargets(ctx, f, allFeeds, f.outputs)
 	if err != nil {
 		return nil, errors.Wrap(err, "compileClosure")
 	}
@@ -292,6 +291,7 @@ func (f *Function) compileClosure() (*Executable, error) {
 		inputNames,
 		inputShapes,
 		collectOutputShapes(f.outputs),
+		nonZeroIndices,
 	), nil
 }
 
@@ -2016,48 +2016,36 @@ func (f *Function) rngSliceScalar(arr compute.Value, idx int) (compute.Value, er
 }
 
 // rngThreeFry implements OpenXLA-compatible ThreeFry-2x32-20 on [2]uint64 state.
+//
+// All internal arithmetic runs in Uint32 using ReinterpretCast at the [2]uint64
+// state/output boundaries so MPSGraph never lowers 64-bit integer shifts or
+// casts through Float32 when fusing kernels.
 func (f *Function) rngThreeFry(stateNode *graphNode, shape shapes.Shape) (newState, values compute.Value, err error) {
 	numElems := shape.Size()
 	if numElems == 0 {
-		emptyVal, err := f.Constant(dtypes.MakeAnySlice(shape.DType, 0), shape.Dimensions...)
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "RNGBitGenerator: empty output")
-		}
-		return stateNode, emptyVal, nil
+		return stateNode, &graphNode{tensor: nil, shape: shape, owner: f}, nil
 	}
 
-	key64, err := f.rngSliceScalar(stateNode, 0)
+	// Reinterpret [2]uint64 state -> [4]uint32 ([key0, key1, ctr0, ctr1]).
+	stateU32Tensor, err := f.ctx().ReinterpretCast(stateNode.tensor, dtypeToBridgeDType(dtypes.Uint32))
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "RNGBitGenerator: reinterpret state as Uint32")
+	}
+	stateU32 := &graphNode{tensor: stateU32Tensor, shape: shapes.Make(dtypes.Uint32, 4), owner: f}
+
+	key0, err := f.rngSliceScalar(stateU32, 0)
 	if err != nil {
 		return nil, nil, err
 	}
-	ctr64, err := f.rngSliceScalar(stateNode, 1)
+	key1, err := f.rngSliceScalar(stateU32, 1)
 	if err != nil {
 		return nil, nil, err
 	}
-	shift32U64, err := f.Constant([]uint64{32})
+	ctr0, err := f.rngSliceScalar(stateU32, 2)
 	if err != nil {
 		return nil, nil, err
 	}
-	split64 := func(v compute.Value) (compute.Value, compute.Value, error) {
-		lo, err := f.ConvertDType(v, dtypes.Uint32)
-		if err != nil {
-			return nil, nil, err
-		}
-		hi64, err := f.ShiftRightLogical(v, shift32U64)
-		if err != nil {
-			return nil, nil, err
-		}
-		hi, err := f.ConvertDType(hi64, dtypes.Uint32)
-		if err != nil {
-			return nil, nil, err
-		}
-		return lo, hi, nil
-	}
-	key0, key1, err := split64(key64)
-	if err != nil {
-		return nil, nil, err
-	}
-	ctr0, ctr1, err := split64(ctr64)
+	ctr1, err := f.rngSliceScalar(stateU32, 3)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2191,38 +2179,15 @@ func (f *Function) rngThreeFry(stateNode *graphNode, shape shapes.Shape) (newSta
 
 	var finalFlat compute.Value
 	if shape.DType == dtypes.Uint64 {
-		pairs, err := f.Reshape(flatWords, numElems, 2)
+		flatWordsNode, err := f.resolveNode(flatWords)
 		if err != nil {
 			return nil, nil, err
 		}
-		lo32, err := f.Slice(pairs, []int{0, 0}, []int{numElems, 1}, []int{1, 1})
+		u64Tensor, err := f.ctx().ReinterpretCast(flatWordsNode.tensor, dtypeToBridgeDType(dtypes.Uint64))
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, errors.Wrap(err, "RNGBitGenerator: reinterpret output as Uint64")
 		}
-		hi32, err := f.Slice(pairs, []int{0, 1}, []int{numElems, 2}, []int{1, 1})
-		if err != nil {
-			return nil, nil, err
-		}
-		lo64, err := f.ConvertDType(lo32, dtypes.Uint64)
-		if err != nil {
-			return nil, nil, err
-		}
-		hi64, err := f.ConvertDType(hi32, dtypes.Uint64)
-		if err != nil {
-			return nil, nil, err
-		}
-		hiShifted, err := f.ShiftLeft(hi64, shift32U64)
-		if err != nil {
-			return nil, nil, err
-		}
-		combined2D, err := f.BitwiseOr(lo64, hiShifted)
-		if err != nil {
-			return nil, nil, err
-		}
-		finalFlat, err = f.Reshape(combined2D, numElems)
-		if err != nil {
-			return nil, nil, err
-		}
+		finalFlat = &graphNode{tensor: u64Tensor, shape: shapes.Make(dtypes.Uint64, numElems), owner: f}
 	} else {
 		finalFlat = flatWords
 		if shape.DType != dtypes.Uint32 {
@@ -2242,26 +2207,66 @@ func (f *Function) rngThreeFry(stateNode *graphNode, shape shapes.Shape) (newSta
 		return nil, nil, err
 	}
 
-	numBlocksConst, err := f.Constant([]uint64{uint64(numBlocks)})
+	// Advance 64-bit counter by numBlocks in Uint32 arithmetic and reinterpret back to [2]uint64.
+	nbLoConst, err := f.Constant([]uint32{uint32(numBlocks)})
 	if err != nil {
 		return nil, nil, err
 	}
-	newCtr64, err := f.Add(ctr64, numBlocksConst)
+	newCtr0, err := f.Add(ctr0, nbLoConst)
 	if err != nil {
 		return nil, nil, err
 	}
-	key1D, err := f.Reshape(key64, 1)
+	ctrCarryBool, err := f.LessThan(newCtr0, ctr0)
 	if err != nil {
 		return nil, nil, err
 	}
-	ctr1D, err := f.Reshape(newCtr64, 1)
+	ctrCarryU32, err := f.ConvertDType(ctrCarryBool, dtypes.Uint32)
 	if err != nil {
 		return nil, nil, err
 	}
-	newState, err = f.Concatenate(0, key1D, ctr1D)
+	newCtr1, err := f.Add(ctr1, ctrCarryU32)
 	if err != nil {
 		return nil, nil, err
 	}
+	if nbHi := uint32(uint64(numBlocks) >> 32); nbHi != 0 {
+		nbHiConst, err := f.Constant([]uint32{nbHi})
+		if err != nil {
+			return nil, nil, err
+		}
+		newCtr1, err = f.Add(newCtr1, nbHiConst)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	key0_1D, err := f.Reshape(key0, 1)
+	if err != nil {
+		return nil, nil, err
+	}
+	key1_1D, err := f.Reshape(key1, 1)
+	if err != nil {
+		return nil, nil, err
+	}
+	ctr0_1D, err := f.Reshape(newCtr0, 1)
+	if err != nil {
+		return nil, nil, err
+	}
+	ctr1_1D, err := f.Reshape(newCtr1, 1)
+	if err != nil {
+		return nil, nil, err
+	}
+	stateWords, err := f.Concatenate(0, key0_1D, key1_1D, ctr0_1D, ctr1_1D)
+	if err != nil {
+		return nil, nil, err
+	}
+	stateWordsNode, err := f.resolveNode(stateWords)
+	if err != nil {
+		return nil, nil, err
+	}
+	newStateTensor, err := f.ctx().ReinterpretCast(stateWordsNode.tensor, dtypeToBridgeDType(dtypes.Uint64))
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "RNGBitGenerator: reinterpret newState as Uint64")
+	}
+	newState = &graphNode{tensor: newStateTensor, shape: stateNode.shape, owner: f}
 	return newState, values, nil
 }
 

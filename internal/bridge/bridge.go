@@ -431,6 +431,17 @@ func (c *Context) Cast(x Tensor, dtype DType) (Tensor, error) {
 	return Tensor(t), nil
 }
 
+// ReinterpretCast bitcasts a tensor to the specified data type, scaling the last
+// dimension by sizeof(srcDType)/sizeof(dstDType).
+func (c *Context) ReinterpretCast(x Tensor, dtype DType) (Tensor, error) {
+	var cErr C.MPSGraphError
+	t := C.mpsgraph_reinterpret_cast(c.handle, C.MPSGraphTensorHandle(x), C.int(dtype), &cErr)
+	if err := extractError(cErr); err != nil {
+		return nil, err
+	}
+	return Tensor(t), nil
+}
+
 // BroadcastTo broadcasts a tensor to the given shape.
 func (c *Context) BroadcastTo(x Tensor, shape []int64) (Tensor, error) {
 	var cErr C.MPSGraphError

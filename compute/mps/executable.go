@@ -39,32 +39,34 @@ func (p *pingPongPool) destroyAllLocked() {
 
 // Executable implements compute.Executable for the MPS backend.
 type Executable struct {
-	backend      *Backend
-	exec         *bridge.Exec
-	inputNames   []string
-	inputShapes  []shapes.Shape
-	outputShapes []shapes.Shape
-	pool         *pingPongPool
-	cleanup      runtime.Cleanup
-	mu           sync.Mutex // Serialize execution for safety.
+	backend              *Backend
+	exec                 *bridge.Exec
+	inputNames           []string
+	inputShapes          []shapes.Shape
+	outputShapes         []shapes.Shape
+	nonZeroOutputIndices []int
+	pool                 *pingPongPool
+	cleanup              runtime.Cleanup
+	mu                   sync.Mutex // Serialize execution for safety.
 }
 
 // Verify interface compliance.
 var _ compute.Executable = &Executable{}
 
 // newExecutable constructs an Executable with a mixed-scope ping-pong buffer pool and GC cleanup.
-func newExecutable(backend *Backend, exec *bridge.Exec, inputNames []string, inputShapes, outputShapes []shapes.Shape) *Executable {
+func newExecutable(backend *Backend, exec *bridge.Exec, inputNames []string, inputShapes, outputShapes []shapes.Shape, nonZeroOutputIndices []int) *Executable {
 	pool := &pingPongPool{
 		buffers: make(map[int64][]*bridge.Buffer),
 	}
 	backend.registerPool(pool)
 	e := &Executable{
-		backend:      backend,
-		exec:         exec,
-		inputNames:   inputNames,
-		inputShapes:  inputShapes,
-		outputShapes: outputShapes,
-		pool:         pool,
+		backend:              backend,
+		exec:                 exec,
+		inputNames:           inputNames,
+		inputShapes:          inputShapes,
+		outputShapes:         outputShapes,
+		nonZeroOutputIndices: nonZeroOutputIndices,
+		pool:                 pool,
 	}
 	e.cleanup = runtime.AddCleanup(e, backend.unregisterAndDestroyPool, pool)
 	return e
@@ -133,25 +135,24 @@ func (e *Executable) Execute(inputs []compute.Buffer, donate []bool, defaultDevi
 	// Prepare output buffers using mixed-scope ping-pong pooling (local pool first, then
 	// cross-executable stealing, then fresh allocation) and evicting unused local buffers.
 	outputBuffers := e.backend.acquireOutputBuffers(e.pool, e.outputShapes)
-	execOutputs := make([]bridge.ExecOutput, len(e.outputShapes))
-	for i, outShape := range e.outputShapes {
-		buf := outputBuffers[i]
-		ptr, nbytes := buf.flatDataPtr()
-		dims := make([]int64, outShape.Rank())
-		for j, d := range outShape.Dimensions {
-			dims[j] = int64(d)
-		}
-		execOutputs[i] = bridge.ExecOutput{
-			Buffer: buf.mtlBuf,
-			Data:   ptr,
-			Size:   nbytes,
-			DType:  dtypeToBridgeDType(outShape.DType),
-			Shape:  dims,
-		}
-	}
-
-	// Execute.
 	if e.exec != nil {
+		execOutputs := make([]bridge.ExecOutput, len(e.nonZeroOutputIndices))
+		for idx, outIdx := range e.nonZeroOutputIndices {
+			outShape := e.outputShapes[outIdx]
+			buf := outputBuffers[outIdx]
+			ptr, nbytes := buf.flatDataPtr()
+			dims := make([]int64, outShape.Rank())
+			for j, d := range outShape.Dimensions {
+				dims[j] = int64(d)
+			}
+			execOutputs[idx] = bridge.ExecOutput{
+				Buffer: buf.mtlBuf,
+				Data:   ptr,
+				Size:   nbytes,
+				DType:  dtypeToBridgeDType(outShape.DType),
+				Shape:  dims,
+			}
+		}
 		if err := e.exec.Execute(execInputs, execOutputs); err != nil {
 			for _, outBuf := range outputBuffers {
 				_ = outBuf.Finalize()

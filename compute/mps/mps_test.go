@@ -1275,4 +1275,124 @@ func TestDonatedBufferReuse(t *testing.T) {
 	})
 }
 
+// TestRNGBitGeneratorEdgeCases tests chained RNGBitGenerator calls within a single
+// compiled graph (exercising Uint64 <-> Uint32 ReinterpretCast round-trips and scalar
+// Uint64 outputs) as well as mixed zero-sized and non-zero-sized graph outputs.
+func TestRNGBitGeneratorEdgeCases(t *testing.T) {
+	backend, err := New("")
+	if err != nil {
+		t.Fatalf("New() failed: %+v", err)
+	}
+	defer backend.Finalize()
+
+	t.Run("ChainedAndScalarUint64", func(t *testing.T) {
+		initState := []uint64{0x0123456789abcdef, 1}
+		// Run two chained calls inside one graph:
+		// Call 1: scalar Uint64 (uses 1 block: ctr=1 -> ctr=2) -> matches ThreeFry/Uint64[3]_Offset1[0]
+		// Call 2: Uint32[2] (uses 1 block: ctr=2 -> ctr=3) -> matches ThreeFry/Uint64[3]_Offset1[1] words
+		b := backend.Builder("rng_chained")
+		fn := b.Main()
+		s0, err := fn.Parameter("state", shapes.Make(dtypes.Uint64, 2), nil)
+		if err != nil {
+			t.Fatalf("Parameter() failed: %+v", err)
+		}
+		s1, v1, err := fn.RNGBitGenerator(s0, shapes.Make(dtypes.Uint64), compute.RNGThreeFry)
+		if err != nil {
+			t.Fatalf("RNGBitGenerator #1 failed: %+v", err)
+		}
+		s2, v2, err := fn.RNGBitGenerator(s1, shapes.Make(dtypes.Uint32, 2), compute.RNGThreeFry)
+		if err != nil {
+			t.Fatalf("RNGBitGenerator #2 failed: %+v", err)
+		}
+		if err := fn.Return([]compute.Value{s2, v1, v2}, nil); err != nil {
+			t.Fatalf("Return() failed: %+v", err)
+		}
+		exec, err := b.Compile()
+		if err != nil {
+			t.Fatalf("Compile() failed: %+v", err)
+		}
+		defer exec.Finalize()
+
+		inBuf, err := backend.BufferFromFlatData(0, initState, shapes.Make(dtypes.Uint64, 2))
+		if err != nil {
+			t.Fatalf("BufferFromFlatData() failed: %+v", err)
+		}
+		outs, err := exec.Execute([]compute.Buffer{inBuf}, []bool{true}, 0)
+		if err != nil {
+			t.Fatalf("Execute() failed: %+v", err)
+		}
+		defer func() {
+			for _, o := range outs {
+				_ = o.Finalize()
+			}
+		}()
+
+		gotState, _ := outs[0].Data()
+		gotV1, _ := outs[1].Data()
+		gotV2, _ := outs[2].Data()
+		wantState := []uint64{0x0123456789abcdef, 3}
+		wantV1 := uint64(0xd3dd861375a52907)
+		wantV2 := []uint32{0x35d0e5f1, 0x8ed17fe4}
+
+		gotStateSlice := gotState.([]uint64)
+		if gotStateSlice[0] != wantState[0] || gotStateSlice[1] != wantState[1] {
+			t.Errorf("chained state = %#x, want %#x", gotStateSlice, wantState)
+		}
+		gotV1Slice := gotV1.([]uint64)
+		if len(gotV1Slice) != 1 || gotV1Slice[0] != wantV1 {
+			t.Errorf("chained v1 (scalar Uint64) = %#x, want %#x", gotV1Slice, wantV1)
+		}
+		gotV2Slice := gotV2.([]uint32)
+		if gotV2Slice[0] != wantV2[0] || gotV2Slice[1] != wantV2[1] {
+			t.Errorf("chained v2 = %#x, want %#x", gotV2Slice, wantV2)
+		}
+	})
+
+	t.Run("MixedPassThroughAndZeroSizedOutput", func(t *testing.T) {
+		inShape := shapes.Make(dtypes.Uint64, 2)
+		b := backend.Builder("mixed_zero_passthrough")
+		fn := b.Main()
+		x, err := fn.Parameter("x", inShape, nil)
+		if err != nil {
+			t.Fatalf("Parameter() failed: %+v", err)
+		}
+		empty, err := fn.Slice(x, []int{0}, []int{0}, []int{1})
+		if err != nil {
+			t.Fatalf("Slice() failed: %+v", err)
+		}
+		if err := fn.Return([]compute.Value{x, empty}, nil); err != nil {
+			t.Fatalf("Return() failed: %+v", err)
+		}
+		exec, err := b.Compile()
+		if err != nil {
+			t.Fatalf("Compile() failed: %+v", err)
+		}
+		defer exec.Finalize()
+
+		inBuf, err := backend.BufferFromFlatData(0, []uint64{123, 456}, inShape)
+		if err != nil {
+			t.Fatalf("BufferFromFlatData() failed: %+v", err)
+		}
+		outs, err := exec.Execute([]compute.Buffer{inBuf}, []bool{true}, 0)
+		if err != nil {
+			t.Fatalf("Execute() failed: %+v", err)
+		}
+		defer func() {
+			for _, o := range outs {
+				_ = o.Finalize()
+			}
+		}()
+
+		got0, _ := outs[0].Data()
+		got1, _ := outs[1].Data()
+		if s := got0.([]uint64); len(s) != 2 || s[0] != 123 || s[1] != 456 {
+			t.Errorf("pass-through output = %v, want [123 456]", s)
+		}
+		if s := got1.([]uint64); len(s) != 0 {
+			t.Errorf("empty output len = %d, want 0", len(s))
+		}
+	})
+}
+
+
 

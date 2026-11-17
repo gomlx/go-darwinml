@@ -491,6 +491,22 @@ MPSGraphTensorHandle mpsgraph_cast(MPSGraphContextHandle handle, MPSGraphTensorH
     }
 }
 
+MPSGraphTensorHandle mpsgraph_reinterpret_cast(MPSGraphContextHandle handle, MPSGraphTensorHandle x,
+    int dtype, MPSGraphError* error) {
+    @autoreleasepool {
+        clearError(error);
+        MPSGraphContext* ctx = (__bridge MPSGraphContext*)handle;
+        MPSGraphTensor* input = (__bridge MPSGraphTensor*)x;
+        MPSDataType mpsType = toMPSDataType(dtype);
+        MPSGraphTensor* result = [ctx.graph reinterpretCastTensor:input toType:mpsType name:nil];
+        if (!result) {
+            setError(error, 32, @"reinterpret_cast failed");
+            return NULL;
+        }
+        return (__bridge void*)result;
+    }
+}
+
 MPSGraphTensorHandle mpsgraph_broadcast_to(MPSGraphContextHandle handle, MPSGraphTensorHandle x,
     int64_t* shape, int rank, MPSGraphError* error) {
     @autoreleasepool {

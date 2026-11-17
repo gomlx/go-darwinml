@@ -93,24 +93,45 @@ func (b *Builder) Compile() (compute.Executable, error) {
 	return b.compileSimple()
 }
 
+// compileTargets filters out zero-sized outputs, wraps any pass-through feed
+// tensors with Identity so MPSGraph doesn't treat a placeholder directly as a
+// target, and compiles the remaining non-zero targets. It returns the compiled
+// executable (nil when all outputs are zero-sized) and the indices into outputs
+// corresponding to the executable's targets.
+func compileTargets(ctx *bridge.Context, owner *Function, feeds, outputs []*graphNode) (*bridge.Exec, []int, error) {
+	nonZeroTargets := make([]*graphNode, 0, len(outputs))
+	nonZeroIndices := make([]int, 0, len(outputs))
+	for i, out := range outputs {
+		if out.tensor == nil || out.shape.Size() == 0 {
+			continue
+		}
+		target := out
+		if containsNode(feeds, out) {
+			idTensor, err := ctx.Identity(out.tensor)
+			if err != nil {
+				return nil, nil, errors.Wrap(err, "identity for pass-through output")
+			}
+			target = &graphNode{tensor: idTensor, shape: out.shape, owner: owner}
+		}
+		nonZeroTargets = append(nonZeroTargets, target)
+		nonZeroIndices = append(nonZeroIndices, i)
+	}
+	if len(nonZeroTargets) == 0 {
+		return nil, nil, nil
+	}
+	info := buildCompileInfo(feeds, nonZeroTargets)
+	exec, err := ctx.Compile(info)
+	if err != nil {
+		return nil, nil, err
+	}
+	return exec, nonZeroIndices, nil
+}
+
 // compileSimple compiles a function without control flow into a single Executable.
 func (b *Builder) compileSimple() (compute.Executable, error) {
-	hasZeroOutput := false
-	for _, out := range b.mainFn.outputs {
-		if out.tensor == nil || out.shape.Size() == 0 {
-			hasZeroOutput = true
-			break
-		}
-	}
-
-	var exec *bridge.Exec
-	if !hasZeroOutput {
-		info := buildCompileInfo(b.mainFn.params, b.mainFn.outputs)
-		var err error
-		exec, err = b.ctx.Compile(info)
-		if err != nil {
-			return nil, errors.Wrap(err, "compiling MPSGraph")
-		}
+	exec, nonZeroIndices, err := compileTargets(b.ctx, b.mainFn, b.mainFn.params, b.mainFn.outputs)
+	if err != nil {
+		return nil, errors.Wrap(err, "compiling MPSGraph")
 	}
 
 	inputNames, inputShapes := collectParamInfo(b.mainFn.params)
@@ -120,6 +141,7 @@ func (b *Builder) compileSimple() (compute.Executable, error) {
 		inputNames,
 		inputShapes,
 		collectOutputShapes(b.mainFn.outputs),
+		nonZeroIndices,
 	), nil
 }
 
