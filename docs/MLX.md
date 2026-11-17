@@ -165,7 +165,7 @@ Every compiled `Executable` in `./compute/mlx` is represented as a **single flat
 - **`If` (`OpTypeIf`) & `While` (`OpTypeWhile`)**: Not supported; return `compute.ErrNotImplemented` (see Section 4).
 - **`Sort` (`OpTypeSort`) with non-standard comparator**: Only standard ascending (`<`, `<=`) and descending (`>`, `>=`) comparators on a key tensor are supported via native GPU `mlx::core::sort` / `mlx::core::argsort`. Custom comparators return `compute.ErrNotImplemented` with a message advising refactoring into a standard ascending/descending sort.
 - **`SelectAndScatterSum` (`OpTypeSelectAndScatterSum`)**: Not supported (`SelectAndScatterMax` and `SelectAndScatterMin` are supported).
-- **FFT & Quantized/Collective Ops (`OpTypeFFT`, `OpTypeFusedQuantizedDense`, `OpTypeQuantizedEmbeddingLookup`, `OpTypeAllReduce`)**: Not supported (`compute.ErrNotImplemented`).
+- **FFT & Quantized/Collective Ops (`OpTypeFFT`, `OpTypeFusedQuantizedDense`, `OpTypeQuantizedGather`, `OpTypeAllReduce`)**: Not supported (`compute.ErrNotImplemented`).
 
 ### 5.3 Operation Quirks & Semantics Notes
 - **Shape Inference & Auto-Broadcasting**:
