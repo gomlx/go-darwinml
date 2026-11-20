@@ -111,6 +111,9 @@ func (buf *gpuBuffer) Shape() (shapes.Shape, error) {
 	if buf == nil || !buf.valid {
 		return shapes.Invalid(), errors.New("Shape: buffer has been finalized")
 	}
+	if buf.backend != nil && buf.backend.IsFinalized() {
+		return shapes.Invalid(), errors.Wrapf(compute.ErrBackendFinalized, "backend %q: Buffer.Shape", BackendName)
+	}
 	return buf.shape.Clone(), nil
 }
 
@@ -119,6 +122,9 @@ func (buf *gpuBuffer) DeviceNum() (compute.DeviceNum, error) {
 	if buf == nil || !buf.valid {
 		return 0, errors.New("DeviceNum: buffer has been finalized")
 	}
+	if buf.backend != nil && buf.backend.IsFinalized() {
+		return 0, errors.Wrapf(compute.ErrBackendFinalized, "backend %q: Buffer.DeviceNum", BackendName)
+	}
 	return 0, nil
 }
 
@@ -126,6 +132,12 @@ func (buf *gpuBuffer) DeviceNum() (compute.DeviceNum, error) {
 func (buf *gpuBuffer) ToFlatData(flat any) error {
 	if buf == nil || !buf.valid {
 		return errors.New("ToFlatData: buffer has been finalized")
+	}
+	if buf.backend != nil {
+		if !buf.backend.lifecycle.Enter() {
+			return errors.Wrapf(compute.ErrBackendFinalized, "backend %q: Buffer.ToFlatData", BackendName)
+		}
+		defer buf.backend.lifecycle.Leave()
 	}
 	return copyFlat(flat, buf.flat)
 }
@@ -136,13 +148,16 @@ func (buf *gpuBuffer) Data() (flat any, err error) {
 		return nil, errors.New("Data: buffer has been finalized")
 	}
 	if buf.backend != nil && buf.backend.IsFinalized() {
-		return nil, errors.New("Data: backend is already finalized")
+		return nil, errors.Wrapf(compute.ErrBackendFinalized, "backend %q: Buffer.Data", BackendName)
 	}
 	return buf.flat, nil
 }
 
 // CopyToDevice copies the buffer to another device (not supported on single-device MPS).
 func (buf *gpuBuffer) CopyToDevice(deviceNum compute.DeviceNum) (compute.Buffer, error) {
+	if buf != nil && buf.backend != nil && buf.backend.IsFinalized() {
+		return nil, errors.Wrapf(compute.ErrBackendFinalized, "backend %q: Buffer.CopyToDevice", BackendName)
+	}
 	return nil, errors.Errorf("CopyToDevice: backend %q only supports a single device", BackendName)
 }
 

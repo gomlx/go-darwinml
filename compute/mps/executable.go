@@ -47,6 +47,8 @@ type Executable struct {
 	nonZeroOutputIndices []int
 	pool                 *pingPongPool
 	cleanup              runtime.Cleanup
+	untrack              func()
+	finalized            bool
 	mu                   sync.Mutex // Serialize execution for safety.
 }
 
@@ -69,14 +71,19 @@ func newExecutable(backend *Backend, exec *bridge.Exec, inputNames []string, inp
 		pool:                 pool,
 	}
 	e.cleanup = runtime.AddCleanup(e, backend.unregisterAndDestroyPool, pool)
+	e.untrack = backend.execTracker.Track(e).Untrack
 	return e
 }
 
 // Finalize releases the compiled executable and any pooled ping-pong buffers.
 func (e *Executable) Finalize() {
+	if e == nil {
+		return
+	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
-
+	untrack := e.untrack
+	e.untrack = nil
+	e.finalized = true
 	e.cleanup.Stop()
 	if e.pool != nil {
 		e.backend.unregisterAndDestroyPool(e.pool)
@@ -85,6 +92,10 @@ func (e *Executable) Finalize() {
 	if e.exec != nil {
 		e.exec.Destroy()
 		e.exec = nil
+	}
+	e.mu.Unlock()
+	if untrack != nil {
+		untrack()
 	}
 }
 
@@ -100,9 +111,24 @@ func (e *Executable) Outputs() (outputShapes []shapes.Shape) {
 
 // Execute runs the compiled graph with the given input buffers.
 func (e *Executable) Execute(inputs []compute.Buffer, donate []bool, defaultDevice compute.DeviceNum) ([]compute.Buffer, error) {
+	if e == nil || e.backend == nil {
+		return nil, errors.New("Execute: executable is nil")
+	}
+	if !e.backend.lifecycle.Enter() {
+		return nil, errors.Wrapf(compute.ErrBackendFinalized, "backend %q: Executable.Execute", BackendName)
+	}
+	defer e.backend.lifecycle.Leave()
+	return e.executeLocked(inputs, donate, defaultDevice)
+}
+
+// executeLocked runs the compiled graph assuming caller already holds e.backend.lifecycle.Enter().
+func (e *Executable) executeLocked(inputs []compute.Buffer, donate []bool, defaultDevice compute.DeviceNum) ([]compute.Buffer, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	if e.finalized {
+		return nil, errors.New("Execute: executable has been finalized")
+	}
 	if len(inputs) != len(e.inputShapes) {
 		return nil, errors.Errorf("Execute: expected %d inputs, got %d", len(e.inputShapes), len(inputs))
 	}
@@ -238,17 +264,32 @@ type ExecutableWithCF struct {
 	inputNames      []string
 	inputShapes     []shapes.Shape
 	outputShapes    []shapes.Shape
+	untrack         func()
+	finalized       bool
 	mu              sync.Mutex
 }
 
 var _ compute.Executable = &ExecutableWithCF{}
 
 func (e *ExecutableWithCF) Finalize() {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	untrack := e.untrack
+	e.untrack = nil
+	e.finalized = true
 	if e.preExec != nil {
 		e.preExec.Destroy()
 		e.preExec = nil
 	}
-	for _, exec := range e.closureExecs {
+	closureExecs := e.closureExecs
+	e.closureExecs = nil
+	e.mu.Unlock()
+	if untrack != nil {
+		untrack()
+	}
+	for _, exec := range closureExecs {
 		exec.Finalize()
 	}
 }
@@ -262,9 +303,19 @@ func (e *ExecutableWithCF) Outputs() []shapes.Shape {
 }
 
 func (e *ExecutableWithCF) Execute(inputs []compute.Buffer, donate []bool, defaultDevice compute.DeviceNum) ([]compute.Buffer, error) {
+	if e == nil || e.backend == nil {
+		return nil, errors.New("ExecuteWithCF: executable is nil")
+	}
+	if !e.backend.lifecycle.Enter() {
+		return nil, errors.Wrapf(compute.ErrBackendFinalized, "backend %q: ExecutableWithCF.Execute", BackendName)
+	}
+	defer e.backend.lifecycle.Leave()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	if e.finalized {
+		return nil, errors.New("ExecuteWithCF: executable has been finalized")
+	}
 	if len(inputs) != len(e.inputShapes) {
 		return nil, errors.Errorf("ExecuteWithCF: expected %d inputs, got %d", len(e.inputShapes), len(inputs))
 	}
@@ -355,7 +406,7 @@ func (e *ExecutableWithCF) execWhile(cf *controlFlowStep, preOutputs []compute.B
 		copy(condInputs[stateCount:], condCaptures)
 		condDonate := make([]bool, len(condInputs))
 
-		condResults, err := condExec.Execute(condInputs, condDonate, 0)
+		condResults, err := condExec.executeLocked(condInputs, condDonate, 0)
 		if err != nil {
 			return nil, errors.Wrapf(err, "While: cond iteration %d", iter)
 		}
@@ -375,7 +426,7 @@ func (e *ExecutableWithCF) execWhile(cf *controlFlowStep, preOutputs []compute.B
 		copy(bodyInputs[stateCount:], bodyCaptures)
 		bodyDonate := make([]bool, len(bodyInputs))
 
-		newState, err := bodyExec.Execute(bodyInputs, bodyDonate, 0)
+		newState, err := bodyExec.executeLocked(bodyInputs, bodyDonate, 0)
 		if err != nil {
 			return nil, errors.Wrapf(err, "While: body iteration %d", iter)
 		}
@@ -417,7 +468,7 @@ func (e *ExecutableWithCF) execIf(cf *controlFlowStep, preOutputs []compute.Buff
 	captures := e.gatherCapturedBuffers(branchFn, preOutputs)
 	donate := make([]bool, len(captures))
 
-	results, err := branchExec.Execute(captures, donate, 0)
+	results, err := branchExec.executeLocked(captures, donate, 0)
 	if err != nil {
 		return nil, errors.Wrap(err, "If: branch execution")
 	}
@@ -502,7 +553,7 @@ func (e *ExecutableWithCF) execSort(cf *controlFlowStep, preOutputs []compute.Bu
 				copy(compInputs[2*inputCount:], compCaptures)
 				donate := make([]bool, len(compInputs))
 
-				results, err := compExec.Execute(compInputs, donate, 0)
+				results, err := compExec.executeLocked(compInputs, donate, 0)
 				if err != nil {
 					sortErr = err
 					return false
@@ -578,7 +629,7 @@ func (e *ExecutableWithCF) execCall(cf *controlFlowStep, preOutputs []compute.Bu
 	copy(allInputs[len(callInputs):], captures)
 	donate := make([]bool, len(allInputs))
 
-	results, err := targetExec.Execute(allInputs, donate, 0)
+	results, err := targetExec.executeLocked(allInputs, donate, 0)
 	if err != nil {
 		return nil, errors.Wrap(err, "Call")
 	}

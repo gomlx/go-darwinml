@@ -316,6 +316,20 @@ func TestCompliance(t *testing.T) {
 	}
 }
 
+func TestFinalize(t *testing.T) {
+	for _, cfg := range []string{"", "dynamic"} {
+		name := cfg
+		if name == "" {
+			name = "static"
+		}
+		t.Run(name, func(t *testing.T) {
+			backendtest.TestFinalize(t, func() (compute.Backend, error) {
+				return mlx.New(cfg)
+			})
+		})
+	}
+}
+
 // BenchmarkCompliance runs all compliance (backendtest) compute.Backend benchmarks on the "mlx" backend.
 // To run:
 //

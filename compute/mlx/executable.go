@@ -20,6 +20,7 @@ type Executable struct {
 	inputNames   []string
 	inputShapes  []shapes.Shape
 	outputShapes []shapes.Shape
+	untrack      func()
 	mu           sync.Mutex
 }
 
@@ -32,22 +33,32 @@ func newExecutable(
 	inputNames []string,
 	inputShapes, outputShapes []shapes.Shape,
 ) *Executable {
-	return &Executable{
+	e := &Executable{
 		backend:      backend,
 		exec:         exec,
 		inputNames:   inputNames,
 		inputShapes:  inputShapes,
 		outputShapes: outputShapes,
 	}
+	e.untrack = backend.execTracker.Track(e).Untrack
+	return e
 }
 
 // Finalize releases the compiled MLX executable.
 func (e *Executable) Finalize() {
+	if e == nil {
+		return
+	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	untrack := e.untrack
+	e.untrack = nil
 	if e.exec != nil {
 		e.exec.Destroy()
 		e.exec = nil
+	}
+	e.mu.Unlock()
+	if untrack != nil {
+		untrack()
 	}
 }
 
@@ -63,6 +74,13 @@ func (e *Executable) Outputs() (outputShapes []shapes.Shape) {
 
 // Execute runs the compiled or dynamic tape on the given input buffers.
 func (e *Executable) Execute(inputs []compute.Buffer, donate []bool, defaultDevice compute.DeviceNum) ([]compute.Buffer, error) {
+	if e == nil || e.backend == nil {
+		return nil, errors.New("Execute: executable is nil")
+	}
+	if !e.backend.lifecycle.Enter() {
+		return nil, errors.Wrapf(compute.ErrBackendFinalized, "backend %q: Executable.Execute", BackendName)
+	}
+	defer e.backend.lifecycle.Leave()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
