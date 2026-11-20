@@ -11,6 +11,7 @@ import (
 
 	"github.com/gomlx/compute"
 	"github.com/gomlx/compute/shapes"
+	"github.com/gomlx/compute/support/xsync"
 	"github.com/gomlx/go-darwinml/internal/bridge"
 	"github.com/pkg/errors"
 )
@@ -24,10 +25,13 @@ const maxIdlePoolSteps = 32
 
 // Backend implements the compute.Backend interface using Apple's MPSGraph.
 type Backend struct {
-	ctx         *bridge.Context
-	deviceName  string
-	mu          sync.RWMutex
-	isFinalized bool
+	ctx        *bridge.Context
+	deviceName string
+	lifecycle  xsync.Lifecycle
+
+	execTracker    xsync.WeakTracker[Executable]
+	cfExecTracker  xsync.WeakTracker[ExecutableWithCF]
+	builderTracker xsync.WeakTracker[Builder]
 
 	poolMu   sync.Mutex
 	pools    map[*pingPongPool]struct{}
@@ -77,37 +81,48 @@ func (b *Backend) Capabilities() compute.Capabilities {
 
 // Builder creates a new computation builder, reusing the backend's Metal device.
 func (b *Backend) Builder(name string) compute.Builder {
+	if !b.lifecycle.Enter() {
+		return newBuilder(b, name, nil)
+	}
+	defer b.lifecycle.Leave()
 	ctx, err := bridge.NewContextWithDevice(b.ctx.DeviceHandle())
 	if err != nil {
 		// Graph building functions panic on error per GoMLX convention.
 		panic(errors.Wrapf(err, "creating MPS builder %q", name))
 	}
-	return newBuilder(b, name, ctx)
+	builder := newBuilder(b, name, ctx)
+	builder.untrack = b.builderTracker.Track(builder).Untrack
+	return builder
 }
 
-// Finalize releases all backend resources.
+// Finalize releases all backend resources, waiting for any in-flight operations to complete first.
 func (b *Backend) Finalize() {
-	b.mu.Lock()
-	if b.isFinalized {
-		b.mu.Unlock()
+	if b == nil {
 		return
 	}
-	b.isFinalized = true
-	b.mu.Unlock()
+	b.lifecycle.Finalize(func() {
+		for _, exec := range b.execTracker.Drain() {
+			exec.Finalize()
+		}
+		for _, cfExec := range b.cfExecTracker.Drain() {
+			cfExec.Finalize()
+		}
+		for _, builder := range b.builderTracker.Drain() {
+			builder.Finalize()
+		}
 
-	b.poolMu.Lock()
-	for pool := range b.pools {
-		pool.destroyAllLocked()
-		delete(b.pools, pool)
-	}
-	b.poolMu.Unlock()
+		b.poolMu.Lock()
+		for pool := range b.pools {
+			pool.destroyAllLocked()
+			delete(b.pools, pool)
+		}
+		b.poolMu.Unlock()
 
-	b.mu.Lock()
-	if b.ctx != nil {
-		b.ctx.Destroy()
-		b.ctx = nil
-	}
-	b.mu.Unlock()
+		if b.ctx != nil {
+			b.ctx.Destroy()
+			b.ctx = nil
+		}
+	})
 }
 
 // registerPool registers an Executable's ping-pong pool with the Backend so other
@@ -118,7 +133,7 @@ func (b *Backend) registerPool(pool *pingPongPool) {
 	}
 	b.poolMu.Lock()
 	defer b.poolMu.Unlock()
-	if !b.isFinalized {
+	if !b.lifecycle.IsFinalized() {
 		pool.lastUsedStep = b.execStep
 		b.pools[pool] = struct{}{}
 	}
@@ -213,7 +228,7 @@ func (b *Backend) returnDonatedBuffers(localPool *pingPongPool, donatedBySize ma
 	b.poolMu.Lock()
 	defer b.poolMu.Unlock()
 
-	if b.isFinalized || localPool == nil {
+	if b.lifecycle.IsFinalized() || localPool == nil {
 		for _, list := range donatedBySize {
 			for _, buf := range list {
 				buf.Destroy()
@@ -228,18 +243,20 @@ func (b *Backend) returnDonatedBuffers(localPool *pingPongPool, donatedBySize ma
 
 // IsFinalized returns whether the backend has been finalized.
 func (b *Backend) IsFinalized() bool {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.isFinalized
+	if b == nil {
+		return true
+	}
+	return b.lifecycle.IsFinalized()
 }
 
 // --- DataInterface implementation ---
 
 // BufferFromFlatData creates a buffer from a Go flat slice.
 func (b *Backend) BufferFromFlatData(deviceNum compute.DeviceNum, flat any, shape shapes.Shape) (compute.Buffer, error) {
-	if b.IsFinalized() {
-		return nil, errors.New("BufferFromFlatData: backend is already finalized")
+	if !b.lifecycle.Enter() {
+		return nil, errors.Wrapf(compute.ErrBackendFinalized, "backend %q: BufferFromFlatData", BackendName)
 	}
+	defer b.lifecycle.Leave()
 	if deviceNum != 0 {
 		return nil, errors.Errorf("BufferFromFlatData: backend %q only supports deviceNum 0, got %d", BackendName, deviceNum)
 	}
@@ -253,9 +270,10 @@ func (b *Backend) HasSharedBuffers() bool {
 
 // NewSharedBuffer creates a new buffer with direct access to its memory.
 func (b *Backend) NewSharedBuffer(deviceNum compute.DeviceNum, shape shapes.Shape) (buffer compute.Buffer, flat any, err error) {
-	if b.IsFinalized() {
-		return nil, nil, errors.New("NewSharedBuffer: backend is already finalized")
+	if !b.lifecycle.Enter() {
+		return nil, nil, errors.Wrapf(compute.ErrBackendFinalized, "backend %q: NewSharedBuffer", BackendName)
 	}
+	defer b.lifecycle.Leave()
 	if deviceNum != 0 {
 		return nil, nil, errors.Errorf("NewSharedBuffer: backend %q only supports deviceNum 0, got %d", BackendName, deviceNum)
 	}

@@ -151,6 +151,9 @@ func (buf *Buffer) Shape() (shapes.Shape, error) {
 	if !buf.valid {
 		return shapes.Invalid(), errors.New("Shape: buffer has been finalized")
 	}
+	if buf.backend != nil && buf.backend.IsFinalized() {
+		return shapes.Invalid(), errors.Wrapf(compute.ErrBackendFinalized, "backend %q: Buffer.Shape", BackendName)
+	}
 	return buf.shape.Clone(), nil
 }
 
@@ -164,6 +167,9 @@ func (buf *Buffer) DeviceNum() (compute.DeviceNum, error) {
 	if !buf.valid {
 		return 0, errors.New("DeviceNum: buffer has been finalized")
 	}
+	if buf.backend != nil && buf.backend.IsFinalized() {
+		return 0, errors.Wrapf(compute.ErrBackendFinalized, "backend %q: Buffer.DeviceNum", BackendName)
+	}
 	return 0, nil
 }
 
@@ -174,7 +180,7 @@ func (buf *Buffer) ensureFlatLocked() error {
 		return errors.New("buffer has been finalized")
 	}
 	if buf.backend != nil && buf.backend.IsFinalized() {
-		return errors.New("backend is already finalized")
+		return errors.Wrapf(compute.ErrBackendFinalized, "backend %q", BackendName)
 	}
 	if buf.flat != nil {
 		return nil
@@ -206,11 +212,8 @@ func (buf *Buffer) ensureFlatLocked() error {
 	return nil
 }
 
-// Data returns direct access to the buffer's flat data slice in unified memory.
-func (buf *Buffer) Data() (flat any, err error) {
-	if buf == nil {
-		return nil, errors.New("Data: buffer is nil")
-	}
+// dataLocked returns direct access to buf.flat assuming caller already holds buf.backend.lifecycle.Enter().
+func (buf *Buffer) dataLocked() (any, error) {
 	buf.mu.Lock()
 	defer buf.mu.Unlock()
 
@@ -220,10 +223,30 @@ func (buf *Buffer) Data() (flat any, err error) {
 	return buf.flat, nil
 }
 
+// Data returns direct access to the buffer's flat data slice in unified memory.
+func (buf *Buffer) Data() (flat any, err error) {
+	if buf == nil {
+		return nil, errors.New("Data: buffer is nil")
+	}
+	if buf.backend != nil {
+		if !buf.backend.lifecycle.Enter() {
+			return nil, errors.Wrapf(compute.ErrBackendFinalized, "backend %q: Buffer.Data", BackendName)
+		}
+		defer buf.backend.lifecycle.Leave()
+	}
+	return buf.dataLocked()
+}
+
 // ToFlatData copies the buffer contents into the given Go flat slice.
 func (buf *Buffer) ToFlatData(flat any) error {
 	if buf == nil {
 		return errors.New("ToFlatData: buffer is nil")
+	}
+	if buf.backend != nil {
+		if !buf.backend.lifecycle.Enter() {
+			return errors.Wrapf(compute.ErrBackendFinalized, "backend %q: Buffer.ToFlatData", BackendName)
+		}
+		defer buf.backend.lifecycle.Leave()
 	}
 	buf.mu.Lock()
 	defer buf.mu.Unlock()
@@ -236,6 +259,9 @@ func (buf *Buffer) ToFlatData(flat any) error {
 
 // CopyToDevice copies the buffer to another device (not supported on single-device MLX).
 func (buf *Buffer) CopyToDevice(deviceNum compute.DeviceNum) (compute.Buffer, error) {
+	if buf != nil && buf.backend != nil && buf.backend.IsFinalized() {
+		return nil, errors.Wrapf(compute.ErrBackendFinalized, "backend %q: Buffer.CopyToDevice", BackendName)
+	}
 	return nil, errors.Errorf("CopyToDevice: backend %q only supports a single device", BackendName)
 }
 

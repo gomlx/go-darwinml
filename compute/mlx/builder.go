@@ -5,6 +5,8 @@
 package mlx
 
 import (
+	"sync"
+
 	"github.com/gomlx/compute"
 	"github.com/gomlx/compute/notimplemented"
 	"github.com/gomlx/compute/shapes"
@@ -16,11 +18,13 @@ import (
 type Builder struct {
 	notimplemented.Builder
 
+	mu       sync.Mutex
 	backend  *Backend
 	name     string
 	tape     *mlxbridge.Tape
 	mainFn   *Function
 	compiled bool
+	untrack  func()
 }
 
 // Verify interface compliance.
@@ -39,9 +43,20 @@ func (b *Builder) Name() string { return b.name }
 
 // Finalize releases the builder's tape.
 func (b *Builder) Finalize() {
-	if b.tape != nil {
-		b.tape.Destroy()
-		b.tape = nil
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	untrack := b.untrack
+	b.untrack = nil
+	tape := b.tape
+	b.tape = nil
+	b.mu.Unlock()
+	if untrack != nil {
+		untrack()
+	}
+	if tape != nil {
+		tape.Destroy()
 	}
 }
 
@@ -72,6 +87,16 @@ func (b *Builder) OpShape(op compute.Value) (shapes.Shape, error) {
 
 // Compile compiles the recorded computation tape into an Executable.
 func (b *Builder) Compile() (compute.Executable, error) {
+	if b == nil || b.backend == nil {
+		return nil, errors.New("Builder is nil")
+	}
+	if !b.backend.lifecycle.Enter() {
+		return nil, errors.Wrapf(compute.ErrBackendFinalized, "backend %q: Builder.Compile(%q)", BackendName, b.name)
+	}
+	defer b.backend.lifecycle.Leave()
+	if b.tape == nil {
+		return nil, errors.New("Builder has been finalized")
+	}
 	if b.compiled {
 		return nil, errors.New("Builder already compiled")
 	}

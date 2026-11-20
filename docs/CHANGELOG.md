@@ -1,4 +1,8 @@
 - Next:
+  - Implemented safe concurrent backend finalization and weak tracking for cold objects across both `"mps"` (`compute/mps/{backend,builder,executable,buffer,mps_test}.go`) and `"mlx"` (`compute/mlx/{backend,builder,executable,buffer,mlx_test}.go`):
+    - Replaced `mu`/`isFinalized` with `xsync.Lifecycle` so `Backend.Finalize()` waits for all in-flight compilations, executions, and buffer transfers before tearing down backend resources, and post-finalize operations on derived objects return `compute.ErrBackendFinalized`.
+    - Added `xsync.WeakTracker` on `Backend` for `Executable`, `ExecutableWithCF` (`mps`), and `Builder` (owning Metal `bridge.Context` / `mlxbridge.Tape`) so `Backend.Finalize()` frees native resources immediately without adding hot-path buffer tracking.
+    - Wired `backendtest.TestFinalize` into `compute/mps/mps_test.go` and `compute/mlx/mlx_test.go`.
   - Updated `RNGBitGenerator(state, shape, algorithm)` for `compute.RNGAlgorithm`:
     - `compute/mlx` (`capabilities.go`, `conv_pool_norm.go`, `internal/mlxbridge/bridge.cpp`, `docs/MLX.md`): implemented stateful OpenXLA-exact `ThreeFry-2x32-20` (`RNGDefault` resolved to `RNGThreeFry` on `[2]uint64` state, supporting static and dynamic shapes) via vectorized `mlx::core` ops; unsupported explicit algorithms return `compute.ErrNotImplemented`.
     - `compute/mps` (`capabilities.go`, `function.go`): replaced the stateless float-based workaround with stateful OpenXLA-exact `ThreeFry-2x32-20` (`RNGDefault` resolved to `RNGThreeFry`) built from integer MPSGraph ops.

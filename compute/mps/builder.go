@@ -5,6 +5,8 @@
 package mps
 
 import (
+	"sync"
+
 	"github.com/gomlx/compute"
 	"github.com/gomlx/compute/notimplemented"
 	"github.com/gomlx/compute/shapes"
@@ -16,11 +18,13 @@ import (
 type Builder struct {
 	notimplemented.Builder // Bootstrap: unimplemented ops return ErrNotImplemented.
 
+	mu       sync.Mutex
 	backend  *Backend
 	name     string
 	ctx      *bridge.Context
 	mainFn   *Function
 	compiled bool
+	untrack  func()
 }
 
 // Verify interface compliance.
@@ -40,9 +44,20 @@ func (b *Builder) Name() string { return b.name }
 
 // Finalize releases the builder's MPSGraph context.
 func (b *Builder) Finalize() {
-	if b.ctx != nil {
-		b.ctx.Destroy()
-		b.ctx = nil
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	untrack := b.untrack
+	b.untrack = nil
+	ctx := b.ctx
+	b.ctx = nil
+	b.mu.Unlock()
+	if untrack != nil {
+		untrack()
+	}
+	if ctx != nil {
+		ctx.Destroy()
 	}
 }
 
@@ -73,6 +88,16 @@ func (b *Builder) OpShape(op compute.Value) (shapes.Shape, error) {
 
 // Compile compiles the computation graph into an executable.
 func (b *Builder) Compile() (compute.Executable, error) {
+	if b == nil || b.backend == nil {
+		return nil, errors.New("Builder is nil")
+	}
+	if !b.backend.lifecycle.Enter() {
+		return nil, errors.Wrapf(compute.ErrBackendFinalized, "backend %q: Builder.Compile(%q)", BackendName, b.name)
+	}
+	defer b.backend.lifecycle.Leave()
+	if b.ctx == nil {
+		return nil, errors.New("Builder has been finalized")
+	}
 	if b.compiled {
 		return nil, errors.New("Builder already compiled")
 	}
@@ -217,7 +242,7 @@ func (b *Builder) compileWithControlFlow() (compute.Executable, error) {
 
 	inputNames, inputShapes := collectParamInfo(b.mainFn.params)
 
-	return &ExecutableWithCF{
+	cfExec := &ExecutableWithCF{
 		backend:         b.backend,
 		preExec:         preExec,
 		preGraphTargets: preGraphTargets,
@@ -228,7 +253,9 @@ func (b *Builder) compileWithControlFlow() (compute.Executable, error) {
 		inputNames:      inputNames,
 		inputShapes:     inputShapes,
 		outputShapes:    collectOutputShapes(b.mainFn.outputs),
-	}, nil
+	}
+	cfExec.untrack = b.backend.cfExecTracker.Track(cfExec).Untrack
+	return cfExec, nil
 }
 
 // buildCompileInfo creates a CompileInfo from parameter nodes and target nodes.

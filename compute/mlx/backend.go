@@ -9,10 +9,10 @@ package mlx
 import (
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/gomlx/compute"
 	"github.com/gomlx/compute/shapes"
+	"github.com/gomlx/compute/support/xsync"
 	"github.com/gomlx/go-darwinml/internal/mlxbridge"
 	"github.com/pkg/errors"
 )
@@ -28,8 +28,9 @@ type Backend struct {
 	eagerContiguous bool
 	capabilities    compute.Capabilities
 
-	mu          sync.RWMutex
-	isFinalized bool
+	lifecycle      xsync.Lifecycle
+	execTracker    xsync.WeakTracker[Executable]
+	builderTracker xsync.WeakTracker[Builder]
 }
 
 // Verify interface compliance.
@@ -149,34 +150,51 @@ func (b *Backend) Capabilities() compute.Capabilities {
 
 // Builder creates a new computation builder.
 func (b *Backend) Builder(name string) compute.Builder {
+	if !b.lifecycle.Enter() {
+		return newBuilder(b, name, nil)
+	}
+	defer b.lifecycle.Leave()
 	tape, err := mlxbridge.NewTape()
 	if err != nil {
 		panic(errors.Wrapf(err, "creating MLX builder %q", name))
 	}
-	return newBuilder(b, name, tape)
+	builder := newBuilder(b, name, tape)
+	builder.untrack = b.builderTracker.Track(builder).Untrack
+	return builder
 }
 
-// Finalize marks the backend as finalized.
+// Finalize waits for in-flight operations to complete, releases tracked executables and builders,
+// and marks the backend as finalized.
 func (b *Backend) Finalize() {
-	b.mu.Lock()
-	b.isFinalized = true
-	b.mu.Unlock()
+	if b == nil {
+		return
+	}
+	b.lifecycle.Finalize(func() {
+		for _, exec := range b.execTracker.Drain() {
+			exec.Finalize()
+		}
+		for _, builder := range b.builderTracker.Drain() {
+			builder.Finalize()
+		}
+	})
 }
 
 // IsFinalized returns whether the backend has been finalized.
 func (b *Backend) IsFinalized() bool {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.isFinalized
+	if b == nil {
+		return true
+	}
+	return b.lifecycle.IsFinalized()
 }
 
 // --- DataInterface implementation ---
 
 // BufferFromFlatData creates a buffer from a Go flat slice.
 func (b *Backend) BufferFromFlatData(deviceNum compute.DeviceNum, flat any, shape shapes.Shape) (compute.Buffer, error) {
-	if b.IsFinalized() {
-		return nil, errors.New("BufferFromFlatData: backend is already finalized")
+	if !b.lifecycle.Enter() {
+		return nil, errors.Wrapf(compute.ErrBackendFinalized, "backend %q: BufferFromFlatData", BackendName)
 	}
+	defer b.lifecycle.Leave()
 	if deviceNum != 0 {
 		return nil, errors.Errorf("BufferFromFlatData: backend %q only supports deviceNum 0, got %d", BackendName, deviceNum)
 	}
@@ -190,9 +208,10 @@ func (b *Backend) HasSharedBuffers() bool {
 
 // NewSharedBuffer creates a new buffer in unified memory with direct CPU slice access.
 func (b *Backend) NewSharedBuffer(deviceNum compute.DeviceNum, shape shapes.Shape) (buffer compute.Buffer, flat any, err error) {
-	if b.IsFinalized() {
-		return nil, nil, errors.New("NewSharedBuffer: backend is already finalized")
+	if !b.lifecycle.Enter() {
+		return nil, nil, errors.Wrapf(compute.ErrBackendFinalized, "backend %q: NewSharedBuffer", BackendName)
 	}
+	defer b.lifecycle.Leave()
 	if deviceNum != 0 {
 		return nil, nil, errors.Errorf("NewSharedBuffer: backend %q only supports deviceNum 0, got %d", BackendName, deviceNum)
 	}
@@ -203,7 +222,7 @@ func (b *Backend) NewSharedBuffer(deviceNum compute.DeviceNum, shape shapes.Shap
 	if err != nil {
 		return nil, nil, err
 	}
-	flatSlice, err := buf.Data()
+	flatSlice, err := buf.dataLocked()
 	if err != nil {
 		_ = buf.Finalize()
 		return nil, nil, err

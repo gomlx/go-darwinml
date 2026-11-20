@@ -27,6 +27,13 @@ func TestCompliance(t *testing.T) {
 	backendtest.RunAll(t, backend, nil)
 }
 
+// TestFinalize verifies backend finalization and concurrent teardown semantics.
+func TestFinalize(t *testing.T) {
+	backendtest.TestFinalize(t, func() (compute.Backend, error) {
+		return New("")
+	})
+}
+
 // BenchmarkCompliance runs all compliance (backendtest) compute.Backend benchmarks on the "mps" backend.
 // To run:
 //
