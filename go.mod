@@ -3,7 +3,7 @@ module github.com/gomlx/go-darwinml
 go 1.27
 
 require (
-	github.com/gomlx/compute v0.1.33
+	github.com/gomlx/compute v0.1.34
 	github.com/pkg/errors v0.9.1
 )
 
