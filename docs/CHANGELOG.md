@@ -1,4 +1,4 @@
-- Next:
+- 2026-11-20:
   - Implemented safe concurrent backend finalization and weak tracking for cold objects across both `"mps"` (`compute/mps/{backend,builder,executable,buffer,mps_test}.go`) and `"mlx"` (`compute/mlx/{backend,builder,executable,buffer,mlx_test}.go`):
     - Replaced `mu`/`isFinalized` with `xsync.Lifecycle` so `Backend.Finalize()` waits for all in-flight compilations, executions, and buffer transfers before tearing down backend resources, and post-finalize operations on derived objects return `compute.ErrBackendFinalized`.
     - Added `xsync.WeakTracker` on `Backend` for `Executable`, `ExecutableWithCF` (`mps`), and `Builder` (owning Metal `bridge.Context` / `mlxbridge.Tape`) so `Backend.Finalize()` frees native resources immediately without adding hot-path buffer tracking.
